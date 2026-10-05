@@ -4247,3 +4247,59 @@
   background: #30D158 !important; /* Authentic Apple iOS Green */
 }
 
+
+/* Super Admin mailbox monitor */
+.crm-admin-app .crm-mail-workspace { display:flex; flex-direction:column; gap:18px }
+.crm-admin-app .crm-mail-monitor { display:flex; flex-direction:column; gap:14px }
+.crm-admin-app .crm-mail-monitor-toolbar { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px }
+.crm-admin-app .crm-mail-monitor-search { display:flex; flex:1 1 260px; align-items:center; gap:8px; max-width:420px; padding:8px 11px; border:1px solid var(--crm-border); border-radius:8px; background:var(--crm-bg); color:var(--crm-text-secondary) }
+.crm-admin-app .crm-mail-monitor-search input { flex:1; min-width:0; border:0; outline:0; background:transparent; color:var(--crm-text-primary); font-size:13px }
+.crm-admin-app .crm-mail-monitor-filters { display:inline-flex; gap:2px; padding:3px; border:1px solid var(--crm-border); border-radius:9px; background:var(--crm-bg) }
+.crm-admin-app .crm-mail-monitor-filters button { padding:5px 11px; border:0; border-radius:6px; background:transparent; color:var(--crm-text-secondary); font-size:12px; font-weight:600; cursor:pointer }
+.crm-admin-app .crm-mail-monitor-filters button.active { background:var(--crm-card); color:var(--crm-text-primary); box-shadow:0 0 0 1px var(--crm-border) }
+.crm-admin-app .crm-mail-monitor-list { display:flex; flex-direction:column; overflow:hidden; border:1px solid var(--crm-border); border-radius:10px }
+.crm-admin-app .crm-mail-monitor-row { display:flex; flex-direction:column; gap:10px; padding:13px 14px; background:var(--crm-card) }
+.crm-admin-app .crm-mail-monitor-row + .crm-mail-monitor-row { border-top:1px solid var(--crm-border) }
+.crm-admin-app .crm-mail-monitor-main { display:grid; grid-template-columns:minmax(200px,1.3fr) minmax(170px,1fr) minmax(140px,.8fr) auto; align-items:center; gap:14px }
+.crm-admin-app .crm-mail-monitor-mailbox, .crm-admin-app .crm-mail-monitor-client { display:flex; align-items:center; gap:10px; min-width:0; color:var(--crm-text-secondary) }
+.crm-admin-app .crm-mail-monitor-mailbox > div:last-child, .crm-admin-app .crm-mail-monitor-client > div { display:flex; flex-direction:column; min-width:0 }
+.crm-admin-app .crm-mail-monitor-mailbox strong, .crm-admin-app .crm-mail-monitor-client strong { overflow:hidden; color:var(--crm-text-primary); font-size:13px; text-overflow:ellipsis; white-space:nowrap }
+.crm-admin-app .crm-mail-monitor-mailbox span, .crm-admin-app .crm-mail-monitor-client span { overflow:hidden; color:var(--crm-text-secondary); font-size:11.5px; text-overflow:ellipsis; white-space:nowrap }
+.crm-admin-app .crm-mail-monitor-activity { display:flex; flex-direction:column; gap:2px; color:var(--crm-text-secondary); font-size:11.5px }
+.crm-admin-app .crm-mail-monitor-activity span { display:inline-flex; align-items:center; gap:5px }
+.crm-admin-app .crm-mail-monitor-muted { color:var(--crm-text-secondary); font-size:12px }
+.crm-admin-app .crm-mail-monitor-pill { justify-self:end; padding:4px 10px; border-radius:999px; font-size:11px; font-weight:700; white-space:nowrap }
+.crm-admin-app .crm-mail-monitor-pill.ok { color:#1f9d4c; background:rgba(48,209,88,.12) }
+.crm-admin-app .crm-mail-monitor-pill.warn { color:#b86e00; background:rgba(255,159,10,.14) }
+.crm-admin-app .crm-mail-monitor-pill.danger { color:#e0475a; background:rgba(246,70,93,.12) }
+.crm-admin-app .crm-mail-monitor-pill.idle { color:var(--crm-text-secondary); background:var(--crm-bg); border:1px solid var(--crm-border) }
+.crm-admin-app .crm-mail-monitor-warn-text { color:#d98200 }
+.crm-admin-app .crm-mail-monitor-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px }
+.crm-admin-app .crm-mail-monitor-toggle { display:inline-flex; align-items:center; gap:6px; padding:0 4px; color:var(--crm-text-primary); font-size:12px; font-weight:600 }
+.crm-admin-app .crm-mail-monitor-assign { display:grid; grid-template-columns:minmax(200px,1fr) minmax(180px,1fr) auto; align-items:end; gap:10px; padding:12px; border:1px solid var(--crm-border); border-radius:8px; background:var(--crm-bg) }
+.crm-admin-app .crm-mail-monitor-assign p { grid-column:1 / -1; margin:0 }
+.crm-admin-app .crm-mail-monitor-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:1px; overflow:hidden; border:1px solid var(--crm-border); border-radius:8px; background:var(--crm-border) }
+.crm-admin-app .crm-mail-monitor-stats > div, .crm-admin-app .crm-mail-monitor-stats > span { display:flex; flex-direction:column; gap:2px; padding:10px 12px; background:var(--crm-bg) }
+.crm-admin-app .crm-mail-monitor-stats > div span { color:var(--crm-text-secondary); font-size:11px }
+.crm-admin-app .crm-mail-monitor-stats > div strong { color:var(--crm-text-primary); font-size:15px }
+.crm-admin-app .crm-mail-monitor-stats > div em { color:var(--crm-text-secondary); font-size:11px; font-style:normal }
+.crm-admin-app .crm-mail-monitor-stats > p { grid-column:1 / -1; margin:0; padding:8px 12px; background:var(--crm-bg) }
+.crm-admin-app .crm-spin { animation:crm-mail-spin 1s linear infinite }
+@keyframes crm-mail-spin { to { transform:rotate(360deg) } }
+@media (max-width: 900px) {
+  .crm-admin-app .crm-mail-monitor-main { grid-template-columns:1fr; gap:8px }
+  .crm-admin-app .crm-mail-monitor-pill { justify-self:start }
+  .crm-admin-app .crm-mail-monitor-assign { grid-template-columns:1fr }
+}
+/* Resets so the mail workspace keeps its own control styling */
+.crm-admin-app .crm-mail-workspace .crm-mail-secondary,.crm-admin-app .crm-mail-workspace .crm-mail-icon { color:var(--crm-text-primary);background:var(--crm-bg);border:1px solid var(--crm-border) }
+.crm-admin-app .crm-mail-workspace .crm-mail-secondary:hover:not(:disabled),.crm-admin-app .crm-mail-workspace .crm-mail-icon:hover:not(:disabled) { background:var(--crm-card-hover) }
+.crm-admin-app .crm-mail-workspace .crm-mail-danger { color:#f0777a;background:rgba(246,70,93,.08);border:1px solid rgba(246,70,93,.28) }
+.crm-admin-app .crm-mail-workspace .crm-mail-danger:hover:not(:disabled) { background:rgba(239,68,68,.1) }
+.crm-admin-app .crm-mail-workspace .crm-mail-monitor-search { display:flex;margin:0;font-weight:400 }
+.crm-admin-app .crm-mail-workspace label.crm-mail-monitor-search input { height:auto;min-height:0;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none }
+.crm-admin-app .crm-mail-workspace .crm-mail-monitor-filters button { min-height:0;padding:5px 11px;border:0;background:transparent;color:var(--crm-text-secondary);box-shadow:none }
+.crm-admin-app .crm-mail-workspace .crm-mail-monitor-filters button:hover { color:var(--crm-text-primary) }
+.crm-admin-app .crm-mail-workspace .crm-mail-monitor-filters button.active { background:var(--crm-card);color:var(--crm-text-primary);box-shadow:0 0 0 1px var(--crm-border) }
+.crm-admin-app .crm-mail-workspace .crm-mail-monitor-toggle { display:inline-flex;margin:0;cursor:pointer }
+.crm-admin-app .crm-mail-workspace .crm-mail-monitor-toggle input[type="checkbox"] { width:16px;height:16px;min-height:0;margin:0;padding:0 }

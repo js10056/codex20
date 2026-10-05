@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import './SiteSettings.css';
-import { HostingerMailSettings } from '../HostingerMailAdmin.jsx';
+import { HostingerMailWorkspace } from '../HostingerMailAdmin.jsx';
 import {
   DEFAULT_PLATFORM_SETTINGS,
   usePlatformSettings,
@@ -1565,7 +1565,7 @@ export default function SiteSettingsTab({ showNotification = () => {}, initialSu
         </nav>
       )}
 
-      {activeSubTab === 'hostinger-mail' && <HostingerMailSettings />}
+      {activeSubTab === 'hostinger-mail' && <HostingerMailWorkspace />}
 
       {/* ── 2. Contact Channels ────────────────────────────────── */}
       {activeSubTab === 'contacts' && (

@@ -9,15 +9,18 @@ export interface MailMessage { uid: number; path: string; date: string; subject:
 export interface Pagination { page: number; perPage: number; total: number; totalPages: number }
 export interface Draft { id?: string; to: string[]; cc: string[]; bcc: string[]; subject: string; text: string; html?: string; attachments: { filename: string; contentType: string; content: string; encoding?: 'base64' }[]; inReplyTo?: { folder: string; uid: number }; forwardOf?: { folder: string; uid: number }; updatedAt?: string }
 type Result<T> = T & { pagination?: Pagination };
+export class MailRequestError extends Error {
+  constructor(message: string, public readonly status: number) { super(message); this.name = 'MailRequestError'; }
+}
 
 async function portalRequest<T>(path: string, options: RequestInit = {}, binary = false): Promise<T> {
   const session = readPortalSession();
   if (!session?.token) throw new Error('Your portal session has expired. Sign in again.');
   const response = await fetch(path, { ...options, credentials: 'same-origin', headers: { ...portalAuthHeaders(session.token), ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers } });
   if (!response.ok) {
-    if (binary) throw new Error(`Attachment download failed (${response.status}).`);
+    if (binary) throw new MailRequestError(`Attachment download failed (${response.status}).`, response.status);
     const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || `Mail request failed (${response.status}).`);
+    throw new MailRequestError(data.error || `Mail request failed (${response.status}).`, response.status);
   }
   if (binary) return response.blob() as Promise<T>;
   const data = await response.json().catch(() => ({}));
@@ -54,4 +57,18 @@ export async function savePortalMailDraft(resourceId: string, draft: Draft) {
   return normalizeDraft(('draft' in result ? result.draft : result) as Draft);
 }
 export async function deletePortalMailDraft(resourceId: string, draftId: string) { return portalRequest(`${base(resourceId)}/drafts/${encodeURIComponent(draftId)}`, json('DELETE')); }
-export async function downloadPortalMailAttachment(resourceId: string, folder: string, uid: number, attachmentId: string) { return portalRequest<Blob>(`${messageUrl(resourceId, folder, uid)}/attachments/${encodeURIComponent(attachmentId)}`, {}, true); }
+export async function downloadPortalMailAttachment(resourceId: string, folder: string, uid: number, attachmentId: string) { return portalRequest<Blob>(`${messageUrl(resourceId, folder, uid)}/attachments/${encodeURIComponent(attachmentId)}`, {}, true); }export interface MailQuota { supported: boolean; totalUsage: number; totalLimit: number; totalPercentage: number }
+export interface BlockedSender { address: string; blockedAt: string }
+export type BulkMailAction =
+  | { action: 'move'; targetFolder: string }
+  | { action: 'delete' }
+  | { action: 'flags'; addFlags?: string[]; removeFlags?: string[] };
+export async function bulkPortalMailAction(resourceId: string, folder: string, uids: number[], action: BulkMailAction) {
+  return portalRequest<{ message?: string; failed?: number }>(`${base(resourceId)}/folders/${encodeURIComponent(folder)}/messages/bulk`, json('POST', { uids, ...action, ...(action.action === 'delete' ? { confirmed: true } : {}) }));
+}
+export async function emptyPortalMailFolder(resourceId: string, folder: string) { return portalRequest(`${base(resourceId)}/folders/${encodeURIComponent(folder)}/messages`, json('DELETE', { confirmed: true })); }
+export async function getPortalMailQuota(resourceId: string) { const d = await portalRequest<{ quota?: MailQuota }>(`${base(resourceId)}/quota`); return d.quota || null; }
+export async function listPortalBlockedSenders(resourceId: string) { const d = await portalRequest<{ blockedSenders?: BlockedSender[] }>(`${base(resourceId)}/blocked-senders`); return d.blockedSenders || []; }
+export async function blockPortalSender(resourceId: string, address: string) { return portalRequest<{ message?: string; moved?: number; blockedSenders?: BlockedSender[] }>(`${base(resourceId)}/blocked-senders`, json('POST', { address })); }
+export async function unblockPortalSender(resourceId: string, address: string) { return portalRequest<{ message?: string; blockedSenders?: BlockedSender[] }>(`${base(resourceId)}/blocked-senders`, json('DELETE', { address })); }
+export async function sendPortalMailIndividually(resourceId: string, payload: object) { return portalRequest<{ message?: string; sentCount?: number; failed?: string[] }>(`${base(resourceId)}/send`, json('POST', { ...payload, sendIndividually: true })); }

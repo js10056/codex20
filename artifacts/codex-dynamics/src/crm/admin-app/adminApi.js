@@ -377,6 +377,8 @@ export async function saveHostingerMailIntegrationAdmin(token) { return adminFet
 export async function testHostingerMailIntegrationAdmin(token) { return adminFetch('/api/admin/integrations/hostinger-mail/test', { method: 'POST', body: token ? { token } : {} }); }
 export async function removeHostingerMailIntegrationAdmin() { return adminFetch('/api/admin/integrations/hostinger-mail', { method: 'DELETE' }); }
 export async function listHostingerMailboxesAdmin() { const d = await adminFetch('/api/admin/hostinger/mailboxes'); return d.mailboxes || []; }
+export async function getHostingerMailOverviewAdmin() { return adminFetch('/api/admin/hostinger/overview'); }
+export async function getHostingerMailboxStatsAdmin(resourceId) { const d = await adminFetch(`/api/admin/hostinger/mailboxes/${encodeURIComponent(resourceId)}/stats`); return d.stats || null; }
 export async function getClientMailboxesAdmin(clientId) { const d = await adminFetch(`/api/admin/clients/${encodeURIComponent(clientId)}/mailboxes`); return d.mailboxes || d.assignments || []; }
 export async function assignClientMailboxAdmin(clientId, payload) { return adminFetch(`/api/admin/clients/${encodeURIComponent(clientId)}/mailboxes`, { method: 'POST', body: payload }); }
 export async function updateClientMailboxAdmin(clientId, assignmentId, payload) { return adminFetch(`/api/admin/clients/${encodeURIComponent(clientId)}/mailboxes/${encodeURIComponent(assignmentId)}`, { method: 'PATCH', body: payload }); }

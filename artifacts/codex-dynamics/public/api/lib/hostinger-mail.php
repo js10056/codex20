@@ -494,11 +494,157 @@ function hostingerMailStarred(PDO $pdo, string $resourceId, int $page, int $perP
     ];
 }
 
+function hostingerMailFindFolder(array $folders, string $specialUse, string $namePattern): ?array {
+    foreach ($folders as $folder) {
+        if (is_array($folder) && strcasecmp((string)($folder['specialUse'] ?? ''), $specialUse) === 0) return $folder;
+    }
+    foreach ($folders as $folder) {
+        if (is_array($folder) && preg_match($namePattern, (string)($folder['name'] ?? ''))) return $folder;
+    }
+    return null;
+}
+
+function hostingerMailFolderRows(PDO $pdo, string $resourceId): array {
+    $folders = hostingerMailListFolders($pdo, $resourceId);
+    return is_array($folders['data'] ?? null) ? array_values(array_filter($folders['data'], 'is_array')) : [];
+}
+
+function hostingerMailRequireKnownFolder(array $folders, string $path): void {
+    $knownPaths = array_map(static fn($item) => (string)($item['path'] ?? ''), $folders);
+    if ($path === '' || strlen($path) > 100 || !in_array($path, $knownPaths, true)) {
+        jsonResponse(['ok' => false, 'error' => 'That destination folder is not available in this mailbox.'], 422);
+    }
+}
+
+function hostingerMailNormalizeUids(mixed $value): array {
+    if (!is_array($value) || count($value) < 1 || count($value) > 100) {
+        jsonResponse(['ok' => false, 'error' => 'Select between 1 and 100 emails.'], 422);
+    }
+    $uids = [];
+    foreach ($value as $uid) {
+        $parsed = filter_var($uid, FILTER_VALIDATE_INT);
+        if ($parsed === false || $parsed < 1) jsonResponse(['ok' => false, 'error' => 'A selected email is invalid.'], 422);
+        $uids[] = (int)$parsed;
+    }
+    return array_values(array_unique($uids));
+}
+
+function hostingerMailNormalizeFlagList(mixed $value): array {
+    if ($value === null) return [];
+    if (!is_array($value)) jsonResponse(['ok' => false, 'error' => 'Message flags are invalid.'], 422);
+    $allowedFlags = ['\\Seen', '\\Flagged', '\\Answered'];
+    $flags = array_values(array_unique(array_map('strval', $value)));
+    foreach ($flags as $flag) {
+        if (!in_array($flag, $allowedFlags, true)) jsonResponse(['ok' => false, 'error' => 'That email action is not supported.'], 422);
+    }
+    return $flags;
+}
+
+function hostingerMailNormalizeSenderAddress(mixed $value): string {
+    $address = strtolower(trim(is_string($value) ? $value : ''));
+    if ($address === '' || strlen($address) > 254 || filter_var($address, FILTER_VALIDATE_EMAIL) === false) {
+        jsonResponse(['ok' => false, 'error' => 'Enter a valid sender email address.'], 422);
+    }
+    return $address;
+}
+
+function hostingerMailBlockedSenders(PDO $pdo, string $clientId, string $resourceId): array {
+    $stmt = $pdo->prepare(
+        'SELECT address, created_at FROM client_mail_blocked_senders
+         WHERE client_id = ? AND provider_mailbox_id = ? ORDER BY address'
+    );
+    $stmt->execute([$clientId, $resourceId]);
+    return array_map(static fn($row) => [
+        'address' => (string)$row['address'],
+        'blockedAt' => (string)$row['created_at'],
+    ], $stmt->fetchAll());
+}
+
+function hostingerMailRecordActivity(PDO $pdo, string $clientId, string $resourceId, string $action, int $count = 1): void {
+    try {
+        $pdo->prepare(
+            'INSERT INTO client_mail_activity (id, client_id, provider_mailbox_id, action, item_count, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)'
+        )->execute(['mac_' . bin2hex(random_bytes(10)), $clientId, $resourceId, $action, max(1, $count), hostingerMailNow()]);
+    } catch (Throwable $error) {
+        error_log('[hostinger-mail] Activity could not be recorded.');
+    }
+}
+
+function hostingerMailRecordOpened(PDO $pdo, string $clientId, string $resourceId): void {
+    $stmt = $pdo->prepare(
+        "SELECT created_at FROM client_mail_activity
+         WHERE client_id = ? AND provider_mailbox_id = ? AND action = 'opened'
+         ORDER BY created_at DESC LIMIT 1"
+    );
+    $stmt->execute([$clientId, $resourceId]);
+    $last = $stmt->fetchColumn();
+    if ($last && strtotime((string)$last) > time() - 900) return;
+    hostingerMailRecordActivity($pdo, $clientId, $resourceId, 'opened');
+}
+
+/** Moves messages from blocked senders out of the inbox page and returns the remaining rows. */
+function hostingerMailFilterBlockedInbox(PDO $pdo, string $clientId, string $resourceId, string $folder, array $messages): array {
+    $blocked = array_column(hostingerMailBlockedSenders($pdo, $clientId, $resourceId), 'address');
+    if (!$blocked || !$messages) return ['messages' => $messages, 'moved' => 0];
+    $folders = hostingerMailFolderRows($pdo, $resourceId);
+    $inbox = hostingerMailFindFolder($folders, '\\Inbox', '/^inbox$/i');
+    $junk = hostingerMailFindFolder($folders, '\\Junk', '/spam|junk/i');
+    if (!$inbox || !$junk || (string)$inbox['path'] !== $folder) return ['messages' => $messages, 'moved' => 0];
+    $moveUids = [];
+    $kept = [];
+    foreach ($messages as $message) {
+        $from = strtolower((string)($message['from']['address'] ?? ''));
+        if ($from !== '' && in_array($from, $blocked, true) && (int)($message['uid'] ?? 0) > 0) {
+            $moveUids[] = (int)$message['uid'];
+        } else {
+            $kept[] = $message;
+        }
+    }
+    if (!$moveUids) return ['messages' => $messages, 'moved' => 0];
+    try {
+        hostingerMailStoredRequest($pdo, 'POST', hostingerMailFolderPath($resourceId, $folder, '/messages/move'), [
+            'uids' => $moveUids,
+            'targetFolder' => (string)$junk['path'],
+        ]);
+    } catch (HostingerMailApiException $error) {
+        return ['messages' => $messages, 'moved' => 0];
+    }
+    return ['messages' => $kept, 'moved' => count($moveUids)];
+}
+
+function hostingerMailboxStats(PDO $pdo, string $resourceId): array {
+    $folders = hostingerMailFolderRows($pdo, $resourceId);
+    $summary = ['inbox' => null, 'sent' => null, 'junk' => null, 'trash' => null];
+    $uses = ['inbox' => ['\\Inbox', '/^inbox$/i'], 'sent' => ['\\Sent', '/sent/i'], 'junk' => ['\\Junk', '/spam|junk/i'], 'trash' => ['\\Trash', '/trash|deleted/i']];
+    foreach ($uses as $key => [$use, $pattern]) {
+        $folder = hostingerMailFindFolder($folders, $use, $pattern);
+        if ($folder) $summary[$key] = ['messageCount' => (int)($folder['messageCount'] ?? 0), 'unreadCount' => (int)($folder['unreadCount'] ?? 0)];
+    }
+    $totalMessages = array_sum(array_map(static fn($folder) => (int)($folder['messageCount'] ?? 0), $folders));
+    $quota = null;
+    try {
+        $quotaResponse = hostingerMailStoredRequest($pdo, 'GET', '/api/v1/mailboxes/' . hostingerMailSegment($resourceId) . '/quota');
+        $quotaData = hostingerMailResponseData($quotaResponse);
+        $quota = [
+            'supported' => (bool)($quotaData['supported'] ?? false),
+            'totalUsage' => (int)($quotaData['totalUsage'] ?? 0),
+            'totalLimit' => (int)($quotaData['totalLimit'] ?? 0),
+            'totalPercentage' => (int)($quotaData['totalPercentage'] ?? 0),
+        ];
+    } catch (HostingerMailApiException $error) {
+        $quota = null;
+    }
+    return ['folders' => $summary, 'folderCount' => count($folders), 'totalMessages' => $totalMessages, 'quota' => $quota];
+}
+
 function hostingerMailHandleRequest(PDO $pdo, string $apiPath, string $method, array $input, ?array $adminSession, ?array $portalSession): bool {
     $adminBase = '/admin/integrations/hostinger-mail';
     $isAdminMailRoute = $apiPath === $adminBase
         || $apiPath === $adminBase . '/test'
         || $apiPath === '/admin/hostinger/mailboxes'
+        || $apiPath === '/admin/hostinger/overview'
+        || preg_match('#^/admin/hostinger/mailboxes/([^/]+)/stats$#', $apiPath) === 1
         || preg_match('#^/admin/clients/([^/]+)/mailboxes(?:/([^/]+))?$#', $apiPath) === 1
         || preg_match('#^/admin/client-mailboxes/([^/]+)/reassign$#', $apiPath) === 1;
 
@@ -612,6 +758,112 @@ function hostingerMailHandleRequest(PDO $pdo, string $apiPath, string $method, a
                 hostingerMailRecordAudit($pdo, (string)$staff['id'], 'HOSTINGER_MAIL_TOKEN_REMOVED', 'Super Admin removed the Hostinger Mail API credential.');
             }
             jsonResponse(['ok' => true, 'message' => 'Hostinger Mail API token removed.']);
+        }
+
+        if ($apiPath === '/admin/hostinger/overview' && $method === 'GET') {
+            $integration = hostingerMailIntegration($pdo);
+            $configured = !empty($integration['encrypted_token']);
+            $providerMailboxes = [];
+            $providerError = null;
+            if ($configured) {
+                try {
+                    foreach (hostingerMailAccount($pdo)['mailboxes'] as $mailbox) {
+                        if (!is_array($mailbox) || empty($mailbox['resourceId']) || empty($mailbox['address'])) continue;
+                        $providerMailboxes[(string)$mailbox['resourceId']] = (string)$mailbox['address'];
+                    }
+                } catch (HostingerMailApiException $error) {
+                    $providerError = hostingerMailSafeProviderError($error, true)[0];
+                }
+            }
+            $assignmentStmt = $pdo->prepare(
+                "SELECT m.id, m.client_id, m.provider_mailbox_id, m.email_address, m.display_name, m.status, m.created_at,
+                        c.name AS client_name, c.company AS client_company, c.email AS client_email,
+                        a.portal_enabled, a.status AS portal_status
+                 FROM client_mailboxes m
+                 LEFT JOIN clients c ON c.id = m.client_id
+                 LEFT JOIN client_portal_access a ON a.client_id = m.client_id
+                 WHERE m.provider = 'hostinger'"
+            );
+            $assignmentStmt->execute();
+            $assignments = [];
+            foreach ($assignmentStmt->fetchAll() as $row) $assignments[(string)$row['provider_mailbox_id']] = $row;
+
+            $activityStmt = $pdo->prepare(
+                "SELECT provider_mailbox_id, action, MAX(created_at) AS last_at,
+                        SUM(CASE WHEN created_at >= ? THEN item_count ELSE 0 END) AS recent_count
+                 FROM client_mail_activity GROUP BY provider_mailbox_id, action"
+            );
+            $activityStmt->execute([date('c', time() - 86400 * 30)]);
+            $activity = [];
+            foreach ($activityStmt->fetchAll() as $row) {
+                $activity[(string)$row['provider_mailbox_id']][(string)$row['action']] = [
+                    'lastAt' => (string)$row['last_at'],
+                    'recentCount' => (int)$row['recent_count'],
+                ];
+            }
+
+            $resourceIds = array_values(array_unique(array_merge(array_keys($providerMailboxes), array_keys($assignments))));
+            $rows = [];
+            foreach ($resourceIds as $resourceId) {
+                $assignment = $assignments[$resourceId] ?? null;
+                $mailboxActivity = $activity[$resourceId] ?? [];
+                $rows[] = [
+                    'resourceId' => $resourceId,
+                    'address' => $providerMailboxes[$resourceId] ?? (string)($assignment['email_address'] ?? ''),
+                    'inHostinger' => $configured && $providerError === null ? isset($providerMailboxes[$resourceId]) : null,
+                    'assignment' => $assignment ? [
+                        'id' => (string)$assignment['id'],
+                        'clientId' => (string)$assignment['client_id'],
+                        'clientName' => (string)($assignment['client_name'] ?? ''),
+                        'clientCompany' => (string)($assignment['client_company'] ?? ''),
+                        'clientEmail' => (string)($assignment['client_email'] ?? ''),
+                        'displayName' => (string)$assignment['display_name'],
+                        'enabled' => $assignment['status'] === 'enabled',
+                        'portalActive' => !empty($assignment['portal_enabled']) && ($assignment['portal_status'] ?? '') === 'Active',
+                        'assignedAt' => (string)$assignment['created_at'],
+                    ] : null,
+                    'activity' => [
+                        'lastOpenedAt' => $mailboxActivity['opened']['lastAt'] ?? null,
+                        'lastSentAt' => $mailboxActivity['sent']['lastAt'] ?? null,
+                        'sentLast30Days' => $mailboxActivity['sent']['recentCount'] ?? 0,
+                    ],
+                ];
+            }
+            usort($rows, static fn($left, $right) => strcasecmp($left['address'], $right['address']));
+
+            $clientStmt = $pdo->prepare(
+                "SELECT c.id, c.name, c.company, c.email, a.portal_enabled, a.status AS portal_status
+                 FROM clients c LEFT JOIN client_portal_access a ON a.client_id = c.id
+                 WHERE c.deleted_at IS NULL OR c.deleted_at = ''
+                 ORDER BY COALESCE(NULLIF(c.company, ''), c.name) LIMIT 1000"
+            );
+            $clientStmt->execute();
+            $clients = array_map(static fn($row) => [
+                'id' => (string)$row['id'],
+                'name' => (string)($row['name'] ?? ''),
+                'company' => (string)($row['company'] ?? ''),
+                'email' => (string)($row['email'] ?? ''),
+                'portalActive' => !empty($row['portal_enabled']) && ($row['portal_status'] ?? '') === 'Active',
+            ], $clientStmt->fetchAll());
+
+            jsonResponse([
+                'ok' => true,
+                'integration' => [
+                    'configured' => $configured,
+                    'status' => $integration['status'] ?? 'not_configured',
+                    'lastTestedAt' => $integration['last_tested_at'] ?? null,
+                    'lastSuccessAt' => $integration['last_success_at'] ?? null,
+                ],
+                'providerError' => $providerError,
+                'mailboxes' => $rows,
+                'clients' => $clients,
+            ]);
+        }
+
+        if (preg_match('#^/admin/hostinger/mailboxes/([^/]+)/stats$#', $apiPath, $matches) && $method === 'GET') {
+            $resourceId = rawurldecode($matches[1]);
+            if (!preg_match('/^AC[A-Za-z0-9]+$/', $resourceId)) jsonResponse(['ok' => false, 'error' => 'Mailbox was not found.'], 404);
+            jsonResponse(['ok' => true, 'stats' => hostingerMailboxStats($pdo, $resourceId)]);
         }
 
         if ($apiPath === '/admin/hostinger/mailboxes' && $method === 'GET') {
@@ -760,6 +1012,8 @@ function hostingerMailHandleRequest(PDO $pdo, string $apiPath, string $method, a
                     $pdo->beginTransaction();
                     $pdo->prepare('DELETE FROM client_mail_drafts WHERE client_id = ? AND provider_mailbox_id = ?')
                         ->execute([$clientId, $assignment['provider_mailbox_id']]);
+                    $pdo->prepare('DELETE FROM client_mail_blocked_senders WHERE client_id = ? AND provider_mailbox_id = ?')
+                        ->execute([$clientId, $assignment['provider_mailbox_id']]);
                     $pdo->prepare('DELETE FROM client_mailboxes WHERE id = ?')->execute([$assignmentId]);
                     $pdo->commit();
                     hostingerMailRecordAudit(
@@ -811,6 +1065,8 @@ function hostingerMailHandleRequest(PDO $pdo, string $apiPath, string $method, a
             $newDisplayName = $displayName !== '' ? $displayName : (string)$assignment['email_address'];
             $pdo->prepare('DELETE FROM client_mail_drafts WHERE client_id = ? AND provider_mailbox_id = ?')
                 ->execute([$assignment['client_id'], $assignment['provider_mailbox_id']]);
+            $pdo->prepare('DELETE FROM client_mail_blocked_senders WHERE client_id = ? AND provider_mailbox_id = ?')
+                ->execute([$assignment['client_id'], $assignment['provider_mailbox_id']]);
             $pdo->prepare('UPDATE client_mailboxes SET client_id = ?, display_name = ?, updated_at = ? WHERE id = ?')
                 ->execute([$targetClientId, $newDisplayName, $now, $assignmentId]);
             $pdo->commit();
@@ -860,6 +1116,7 @@ function hostingerMailHandleRequest(PDO $pdo, string $apiPath, string $method, a
         $resourceId = rawurldecode($matches[1]);
         hostingerMailRequireClientMailbox($pdo, (string)$portalSession['id'], $resourceId);
         $folders = hostingerMailListFolders($pdo, $resourceId);
+        hostingerMailRecordOpened($pdo, (string)$portalSession['id'], $resourceId);
         jsonResponse([
             'ok' => true,
             'folders' => is_array($folders['data'] ?? null) ? $folders['data'] : [],
@@ -931,6 +1188,134 @@ function hostingerMailHandleRequest(PDO $pdo, string $apiPath, string $method, a
         jsonResponse(['ok' => false, 'error' => 'Method not allowed.'], 405);
     }
 
+    if (preg_match('#^/portal/mailboxes/([^/]+)/quota$#', $apiPath, $matches) && $method === 'GET') {
+        $resourceId = rawurldecode($matches[1]);
+        hostingerMailRequireClientMailbox($pdo, (string)$portalSession['id'], $resourceId);
+        $response = hostingerMailStoredRequest($pdo, 'GET', '/api/v1/mailboxes/' . hostingerMailSegment($resourceId) . '/quota');
+        $quota = hostingerMailResponseData($response);
+        jsonResponse(['ok' => true, 'quota' => [
+            'supported' => (bool)($quota['supported'] ?? false),
+            'totalUsage' => (int)($quota['totalUsage'] ?? 0),
+            'totalLimit' => (int)($quota['totalLimit'] ?? 0),
+            'totalPercentage' => (int)($quota['totalPercentage'] ?? 0),
+        ]]);
+    }
+
+    if (preg_match('#^/portal/mailboxes/([^/]+)/blocked-senders$#', $apiPath, $matches)) {
+        $resourceId = rawurldecode($matches[1]);
+        $clientId = (string)$portalSession['id'];
+        hostingerMailRequireClientMailbox($pdo, $clientId, $resourceId);
+        if ($method === 'GET') {
+            jsonResponse(['ok' => true, 'blockedSenders' => hostingerMailBlockedSenders($pdo, $clientId, $resourceId)]);
+        }
+        if ($method === 'POST') {
+            $address = hostingerMailNormalizeSenderAddress($input['address'] ?? null);
+            $ownStmt = $pdo->prepare("SELECT 1 FROM client_mailboxes WHERE client_id = ? AND LOWER(email_address) = ? LIMIT 1");
+            $ownStmt->execute([$clientId, $address]);
+            if ($ownStmt->fetchColumn()) jsonResponse(['ok' => false, 'error' => 'You cannot block one of your own mailboxes.'], 422);
+            $existsStmt = $pdo->prepare('SELECT 1 FROM client_mail_blocked_senders WHERE client_id = ? AND provider_mailbox_id = ? AND address = ? LIMIT 1');
+            $existsStmt->execute([$clientId, $resourceId, $address]);
+            if (!$existsStmt->fetchColumn()) {
+                $countStmt = $pdo->prepare('SELECT COUNT(*) FROM client_mail_blocked_senders WHERE client_id = ? AND provider_mailbox_id = ?');
+                $countStmt->execute([$clientId, $resourceId]);
+                if ((int)$countStmt->fetchColumn() >= 500) jsonResponse(['ok' => false, 'error' => 'The blocked sender list is full. Unblock a sender first.'], 422);
+                $pdo->prepare('INSERT INTO client_mail_blocked_senders (id, client_id, provider_mailbox_id, address, created_at) VALUES (?, ?, ?, ?, ?)')
+                    ->execute(['mbs_' . bin2hex(random_bytes(10)), $clientId, $resourceId, $address, hostingerMailNow()]);
+            }
+            $moved = 0;
+            $folders = hostingerMailFolderRows($pdo, $resourceId);
+            $inbox = hostingerMailFindFolder($folders, '\\Inbox', '/^inbox$/i');
+            $junk = hostingerMailFindFolder($folders, '\\Junk', '/spam|junk/i');
+            if ($inbox && $junk) {
+                $search = hostingerMailStoredRequest(
+                    $pdo,
+                    'POST',
+                    hostingerMailFolderPath($resourceId, (string)$inbox['path'], '/messages/search?' . hostingerMailQuery(['page' => 1, 'perPage' => 100])),
+                    ['from' => $address]
+                );
+                $uids = [];
+                foreach ((hostingerMailResponseCollection($search)['data'] ?? []) as $message) {
+                    if (is_array($message) && strtolower((string)($message['from']['address'] ?? '')) === $address && (int)($message['uid'] ?? 0) > 0) {
+                        $uids[] = (int)$message['uid'];
+                    }
+                }
+                if ($uids) {
+                    hostingerMailStoredRequest($pdo, 'POST', hostingerMailFolderPath($resourceId, (string)$inbox['path'], '/messages/move'), [
+                        'uids' => $uids,
+                        'targetFolder' => (string)$junk['path'],
+                    ]);
+                    $moved = count($uids);
+                }
+            }
+            jsonResponse([
+                'ok' => true,
+                'message' => $moved ? "Sender blocked. {$moved} message(s) moved to Spam." : 'Sender blocked. Future messages will be moved to Spam.',
+                'moved' => $moved,
+                'blockedSenders' => hostingerMailBlockedSenders($pdo, $clientId, $resourceId),
+            ]);
+        }
+        if ($method === 'DELETE') {
+            $address = hostingerMailNormalizeSenderAddress($input['address'] ?? null);
+            $pdo->prepare('DELETE FROM client_mail_blocked_senders WHERE client_id = ? AND provider_mailbox_id = ? AND address = ?')
+                ->execute([$clientId, $resourceId, $address]);
+            jsonResponse([
+                'ok' => true,
+                'message' => 'Sender unblocked.',
+                'blockedSenders' => hostingerMailBlockedSenders($pdo, $clientId, $resourceId),
+            ]);
+        }
+        jsonResponse(['ok' => false, 'error' => 'Method not allowed.'], 405);
+    }
+
+    if (preg_match('#^/portal/mailboxes/([^/]+)/folders/([^/]+)/messages/bulk$#', $apiPath, $matches) && $method === 'POST') {
+        $resourceId = rawurldecode($matches[1]);
+        $folder = rawurldecode($matches[2]);
+        hostingerMailRequireClientMailbox($pdo, (string)$portalSession['id'], $resourceId);
+        $uids = hostingerMailNormalizeUids($input['uids'] ?? null);
+        $action = (string)($input['action'] ?? '');
+        if ($action === 'move') {
+            $targetFolder = trim((string)($input['targetFolder'] ?? ''));
+            hostingerMailRequireKnownFolder(hostingerMailFolderRows($pdo, $resourceId), $targetFolder);
+            hostingerMailStoredRequest($pdo, 'POST', hostingerMailFolderPath($resourceId, $folder, '/messages/move'), [
+                'uids' => $uids,
+                'targetFolder' => $targetFolder,
+            ]);
+            jsonResponse(['ok' => true, 'message' => count($uids) . ' email(s) moved.', 'count' => count($uids)]);
+        }
+        if ($action === 'delete') {
+            if (($input['confirmed'] ?? false) !== true) jsonResponse(['ok' => false, 'error' => 'Confirm permanent deletion before continuing.'], 422);
+            hostingerMailStoredRequest($pdo, 'POST', hostingerMailFolderPath($resourceId, $folder, '/messages/delete'), ['uids' => $uids]);
+            jsonResponse(['ok' => true, 'message' => count($uids) . ' email(s) permanently deleted.', 'count' => count($uids)]);
+        }
+        if ($action === 'flags') {
+            $addFlags = hostingerMailNormalizeFlagList($input['addFlags'] ?? []);
+            $removeFlags = hostingerMailNormalizeFlagList($input['removeFlags'] ?? []);
+            if (!$addFlags && !$removeFlags) jsonResponse(['ok' => false, 'error' => 'Choose an email action.'], 422);
+            $payload = ['uids' => $uids];
+            if ($addFlags) $payload['addFlags'] = $addFlags;
+            if ($removeFlags) $payload['removeFlags'] = $removeFlags;
+            $response = hostingerMailStoredRequest($pdo, 'POST', hostingerMailFolderPath($resourceId, $folder, '/messages/flags'), $payload);
+            $result = hostingerMailResponseData($response);
+            $failed = is_array($result['failed'] ?? null) ? count($result['failed']) : 0;
+            jsonResponse(['ok' => true, 'message' => $failed ? "Updated with {$failed} failure(s)." : 'Emails updated.', 'failed' => $failed]);
+        }
+        jsonResponse(['ok' => false, 'error' => 'That email action is not supported.'], 422);
+    }
+
+    if (preg_match('#^/portal/mailboxes/([^/]+)/folders/([^/]+)/messages$#', $apiPath, $matches) && $method === 'DELETE') {
+        $resourceId = rawurldecode($matches[1]);
+        $folder = rawurldecode($matches[2]);
+        hostingerMailRequireClientMailbox($pdo, (string)$portalSession['id'], $resourceId);
+        if (($input['confirmed'] ?? false) !== true) jsonResponse(['ok' => false, 'error' => 'Confirm emptying this folder before continuing.'], 422);
+        $folders = hostingerMailFolderRows($pdo, $resourceId);
+        $trash = hostingerMailFindFolder($folders, '\\Trash', '/trash|deleted/i');
+        $junk = hostingerMailFindFolder($folders, '\\Junk', '/spam|junk/i');
+        $allowed = array_filter([(string)($trash['path'] ?? ''), (string)($junk['path'] ?? '')]);
+        if (!in_array($folder, $allowed, true)) jsonResponse(['ok' => false, 'error' => 'Only Trash and Spam can be emptied.'], 422);
+        hostingerMailStoredRequest($pdo, 'DELETE', hostingerMailFolderPath($resourceId, $folder, '/messages'));
+        jsonResponse(['ok' => true, 'message' => 'Folder emptied.']);
+    }
+
     if (preg_match('#^/portal/mailboxes/([^/]+)/folders/([^/]+)/messages/search$#', $apiPath, $matches)
         && $method === 'POST') {
         $resourceId = rawurldecode($matches[1]);
@@ -972,10 +1357,17 @@ function hostingerMailHandleRequest(PDO $pdo, string $apiPath, string $method, a
         );
         $response = hostingerMailStoredRequest($pdo, 'GET', $path);
         $data = hostingerMailResponseCollection($response);
+        $rows = is_array($data['data'] ?? null) ? array_values(array_filter($data['data'], 'is_array')) : [];
+        $filtered = hostingerMailFilterBlockedInbox($pdo, (string)$portalSession['id'], $resourceId, $folder, $rows);
+        $pagination = $data['pagination'] ?? null;
+        if ($filtered['moved'] > 0 && is_array($pagination)) {
+            $pagination['total'] = max(0, (int)($pagination['total'] ?? 0) - $filtered['moved']);
+        }
         jsonResponse([
             'ok' => true,
-            'messages' => is_array($data['data'] ?? null) ? $data['data'] : [],
-            'pagination' => $data['pagination'] ?? null,
+            'messages' => $filtered['messages'],
+            'pagination' => $pagination,
+            'blockedMoved' => $filtered['moved'],
         ]);
     }
 
@@ -1104,7 +1496,41 @@ function hostingerMailHandleRequest(PDO $pdo, string $apiPath, string $method, a
         $payload = hostingerMailNormalizeCompose($input, true);
         $payload['displayName'] = (string)$assignment['display_name'];
         $path = '/api/v1/mailboxes/' . hostingerMailSegment($resourceId) . '/send';
+        $clientId = (string)$portalSession['id'];
+        if (($input['sendIndividually'] ?? false) === true) {
+            $recipients = $payload['to'] ?? [];
+            if (!empty($payload['cc']) || !empty($payload['bcc']) || isset($payload['inReplyTo']) || isset($payload['forwardOf'])) {
+                jsonResponse(['ok' => false, 'error' => 'Individual sending uses the To field only, without Cc, Bcc, replies, or forwards.'], 422);
+            }
+            if (count($recipients) < 1 || count($recipients) > 50) {
+                jsonResponse(['ok' => false, 'error' => 'Individual sending supports between 1 and 50 recipients.'], 422);
+            }
+            $sent = 0;
+            $failed = [];
+            foreach ($recipients as $recipient) {
+                try {
+                    hostingerMailStoredRequest($pdo, 'POST', $path, array_merge($payload, ['to' => [$recipient]]));
+                    $sent++;
+                } catch (HostingerMailApiException $error) {
+                    $failed[] = $recipient;
+                    if (in_array($error->providerStatus, [0, 401, 403, 429], true)) {
+                        $failed = array_merge($failed, array_slice($recipients, $sent + count($failed)));
+                        break;
+                    }
+                }
+            }
+            if ($sent > 0) hostingerMailRecordActivity($pdo, $clientId, $resourceId, 'sent', $sent);
+            if ($sent === 0) jsonResponse(['ok' => false, 'error' => 'None of the individual emails could be sent. Please try again.', 'failed' => $failed], 502);
+            jsonResponse([
+                'ok' => true,
+                'sent' => true,
+                'sentCount' => $sent,
+                'failed' => array_values(array_unique($failed)),
+                'message' => $failed ? "Sent {$sent} email(s); " . count(array_unique($failed)) . ' could not be sent.' : "Sent {$sent} individual email(s).",
+            ]);
+        }
         hostingerMailStoredRequest($pdo, 'POST', $path, $payload);
+        hostingerMailRecordActivity($pdo, $clientId, $resourceId, 'sent');
         jsonResponse(['ok' => true, 'sent' => true, 'message' => 'Email sent.']);
     }
 

@@ -861,14 +861,41 @@ function initSchema(PDO $pdo): void {
             updated_at VARCHAR(40) NOT NULL
         );
     ");
+    // Codex-side sender blocks (the Hostinger Mail API has no inbound block list)
+    // and a content-free activity log used for Super Admin mailbox monitoring.
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_mail_blocked_senders (
+            id VARCHAR(191) PRIMARY KEY,
+            client_id VARCHAR(191) NOT NULL,
+            provider_mailbox_id VARCHAR(191) NOT NULL,
+            address VARCHAR(320) NOT NULL,
+            created_at VARCHAR(40) NOT NULL
+        );
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_mail_activity (
+            id VARCHAR(191) PRIMARY KEY,
+            client_id VARCHAR(191) NOT NULL,
+            provider_mailbox_id VARCHAR(191) NOT NULL,
+            action VARCHAR(32) NOT NULL,
+            item_count INTEGER NOT NULL DEFAULT 1,
+            created_at VARCHAR(40) NOT NULL
+        );
+    ");
     if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_client_mailboxes_client_status ON client_mailboxes (client_id, status)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_client_mail_drafts_owner_mailbox ON client_mail_drafts (client_id, provider_mailbox_id, updated_at)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_client_mail_blocked_owner ON client_mail_blocked_senders (client_id, provider_mailbox_id, address)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_client_mail_activity_mailbox ON client_mail_activity (provider_mailbox_id, action, created_at)');
     } else {
         $mailboxIndex = $pdo->query("SHOW INDEX FROM client_mailboxes WHERE Key_name = 'idx_client_mailboxes_client_status'")->fetch();
         if (!$mailboxIndex) $pdo->exec('CREATE INDEX idx_client_mailboxes_client_status ON client_mailboxes (client_id, status)');
         $draftIndex = $pdo->query("SHOW INDEX FROM client_mail_drafts WHERE Key_name = 'idx_client_mail_drafts_owner_mailbox'")->fetch();
         if (!$draftIndex) $pdo->exec('CREATE INDEX idx_client_mail_drafts_owner_mailbox ON client_mail_drafts (client_id, provider_mailbox_id, updated_at)');
+        $blockedIndex = $pdo->query("SHOW INDEX FROM client_mail_blocked_senders WHERE Key_name = 'idx_client_mail_blocked_owner'")->fetch();
+        if (!$blockedIndex) $pdo->exec('CREATE INDEX idx_client_mail_blocked_owner ON client_mail_blocked_senders (client_id, provider_mailbox_id, address(191))');
+        $activityIndex = $pdo->query("SHOW INDEX FROM client_mail_activity WHERE Key_name = 'idx_client_mail_activity_mailbox'")->fetch();
+        if (!$activityIndex) $pdo->exec('CREATE INDEX idx_client_mail_activity_mailbox ON client_mail_activity (provider_mailbox_id, action, created_at)');
     }
 
     $pdo->exec("

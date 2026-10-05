@@ -191,10 +191,12 @@ async function startHostingerMock() {
       if (request.method === 'GET' && url.pathname === '/api/v1/mailboxes/ACclientAlpha123/folders') {
         json(200, {
           data: [
-            { path: 'INBOX', name: 'Inbox', specialUse: '\\Inbox', unreadCount: 2 },
-            { path: 'Sent', name: 'Sent', specialUse: '\\Sent', unreadCount: 0 },
+            { path: 'INBOX', name: 'Inbox', specialUse: '\\Inbox', unreadCount: 2, messageCount: 4 },
+            { path: 'Sent', name: 'Sent', specialUse: '\\Sent', unreadCount: 0, messageCount: 1 },
+            { path: 'Junk', name: 'Spam', specialUse: '\\Junk', unreadCount: 0, messageCount: 0 },
+            { path: 'Trash', name: 'Trash', specialUse: '\\Trash', unreadCount: 0, messageCount: 3 },
           ],
-          pagination: { page: 1, perPage: 100, total: 2, totalPages: 1 },
+          pagination: { page: 1, perPage: 100, total: 4, totalPages: 1 },
         });
         return;
       }
@@ -245,6 +247,24 @@ async function startHostingerMock() {
       ) {
         response.writeHead(200, { 'Content-Type': 'application/octet-stream' });
         response.end(Buffer.from('mock attachment data'));
+        return;
+      }
+      if (request.method === 'POST' && /^\/api\/v1\/mailboxes\/ACclientAlpha123\/folders\/[^/]+\/messages\/(move|delete)$/.test(url.pathname)) {
+        response.writeHead(204);
+        response.end();
+        return;
+      }
+      if (request.method === 'POST' && url.pathname === '/api/v1/mailboxes/ACclientAlpha123/folders/INBOX/messages/flags') {
+        json(200, { data: { successful: body.uids || [], failed: [] } });
+        return;
+      }
+      if (request.method === 'DELETE' && url.pathname === '/api/v1/mailboxes/ACclientAlpha123/folders/Trash/messages') {
+        response.writeHead(204);
+        response.end();
+        return;
+      }
+      if (request.method === 'GET' && url.pathname === '/api/v1/mailboxes/ACclientAlpha123/quota') {
+        json(200, { data: { quotas: [], totalUsage: 1024, totalLimit: 4096, totalPercentage: 25, supported: true } });
         return;
       }
       if (request.method === 'POST' && url.pathname === '/api/v1/mailboxes/ACclientAlpha123/send') {
@@ -703,7 +723,7 @@ test('Hostinger mail access is client-scoped and integration responses redact th
       token: clientAlphaToken,
     });
     assert.equal(folders.response.status, 200, JSON.stringify(folders.data));
-    assert.deepEqual(folders.data.folders.map((folder) => folder.path), ['INBOX', 'Sent']);
+    assert.deepEqual(folders.data.folders.map((folder) => folder.path), ['INBOX', 'Sent', 'Junk', 'Trash']);
 
     const messages = await requestJson('/api/portal/mailboxes/ACclientAlpha123/folders/INBOX/messages?page=1&perPage=25', {
       token: clientAlphaToken,
@@ -764,6 +784,115 @@ test('Hostinger mail access is client-scoped and integration responses redact th
     assert.equal(sendRequest?.body.displayName, 'Alpha Info');
     assert.deepEqual(sendRequest?.body.to, ['recipient@example.test']);
     assert.equal(sendRequest?.body.text, 'This request is intercepted by the local provider test server.');
+
+    const base = '/api/portal/mailboxes/ACclientAlpha123';
+    const bulkFlags = await requestJson(`${base}/folders/INBOX/messages/bulk`, {
+      token: clientAlphaToken, method: 'POST', body: { uids: [77, 78], action: 'flags', addFlags: ['\\Seen'] },
+    });
+    assert.equal(bulkFlags.response.status, 200, JSON.stringify(bulkFlags.data));
+    assert.deepEqual(hostingerMockRequests.at(-1).body, { uids: [77, 78], addFlags: ['\\Seen'] });
+
+    const unsupportedFlag = await requestJson(`${base}/folders/INBOX/messages/bulk`, {
+      token: clientAlphaToken, method: 'POST', body: { uids: [77], action: 'flags', addFlags: ['\\Deleted'] },
+    });
+    assert.equal(unsupportedFlag.response.status, 422);
+
+    const bulkMove = await requestJson(`${base}/folders/INBOX/messages/bulk`, {
+      token: clientAlphaToken, method: 'POST', body: { uids: [77], action: 'move', targetFolder: 'Trash' },
+    });
+    assert.equal(bulkMove.response.status, 200, JSON.stringify(bulkMove.data));
+    const moveRequest = hostingerMockRequests.at(-1);
+    assert.equal(moveRequest.path, '/api/v1/mailboxes/ACclientAlpha123/folders/INBOX/messages/move');
+    assert.deepEqual(moveRequest.body, { uids: [77], targetFolder: 'Trash' });
+
+    const unknownTarget = await requestJson(`${base}/folders/INBOX/messages/bulk`, {
+      token: clientAlphaToken, method: 'POST', body: { uids: [77], action: 'move', targetFolder: 'Elsewhere' },
+    });
+    assert.equal(unknownTarget.response.status, 422);
+
+    const unconfirmedDelete = await requestJson(`${base}/folders/Trash/messages/bulk`, {
+      token: clientAlphaToken, method: 'POST', body: { uids: [77], action: 'delete' },
+    });
+    assert.equal(unconfirmedDelete.response.status, 422);
+
+    const emptyInbox = await requestJson(`${base}/folders/INBOX/messages`, {
+      token: clientAlphaToken, method: 'DELETE', body: { confirmed: true },
+    });
+    assert.equal(emptyInbox.response.status, 422, 'only Trash and Spam may be emptied');
+    const emptyTrash = await requestJson(`${base}/folders/Trash/messages`, {
+      token: clientAlphaToken, method: 'DELETE', body: { confirmed: true },
+    });
+    assert.equal(emptyTrash.response.status, 200, JSON.stringify(emptyTrash.data));
+    assert.equal(hostingerMockRequests.at(-1).method, 'DELETE');
+
+    const quota = await requestJson(`${base}/quota`, { token: clientAlphaToken });
+    assert.equal(quota.response.status, 200, JSON.stringify(quota.data));
+    assert.equal(quota.data.quota.totalPercentage, 25);
+
+    const blocked = await requestJson(`${base}/blocked-senders`, {
+      token: clientAlphaToken, method: 'POST', body: { address: 'Sender@Example.test' },
+    });
+    assert.equal(blocked.response.status, 200, JSON.stringify(blocked.data));
+    assert.deepEqual(blocked.data.blockedSenders.map((item) => item.address), ['sender@example.test']);
+    const blockedMove = hostingerMockRequests.at(-1);
+    assert.equal(blockedMove.path, '/api/v1/mailboxes/ACclientAlpha123/folders/INBOX/messages/move');
+    assert.deepEqual(blockedMove.body, { uids: [77], targetFolder: 'Junk' });
+
+    const ownMailbox = await requestJson(`${base}/blocked-senders`, {
+      token: clientAlphaToken, method: 'POST', body: { address: 'info@alpha.example.test' },
+    });
+    assert.equal(ownMailbox.response.status, 422);
+    const foreignBlockList = await requestJson('/api/portal/mailboxes/ACclientBeta456/blocked-senders', { token: clientAlphaToken });
+    assert.equal(foreignBlockList.response.status, 403);
+
+    const filteredInbox = await requestJson(`${base}/folders/INBOX/messages?page=1&perPage=25`, { token: clientAlphaToken });
+    assert.equal(filteredInbox.response.status, 200, JSON.stringify(filteredInbox.data));
+    assert.deepEqual(filteredInbox.data.messages, [], 'blocked senders are filtered out of the inbox');
+    assert.equal(filteredInbox.data.blockedMoved, 1);
+
+    const unblocked = await requestJson(`${base}/blocked-senders`, {
+      token: clientAlphaToken, method: 'DELETE', body: { address: 'sender@example.test' },
+    });
+    assert.equal(unblocked.response.status, 200, JSON.stringify(unblocked.data));
+    assert.deepEqual(unblocked.data.blockedSenders, []);
+
+    const sendsBefore = hostingerMockRequests.filter((item) => item.path.endsWith('/send')).length;
+    const individual = await requestJson(`${base}/send`, {
+      token: clientAlphaToken,
+      method: 'POST',
+      body: { to: ['one@example.test', 'two@example.test'], subject: 'Update', text: 'Hello', sendIndividually: true },
+    });
+    assert.equal(individual.response.status, 200, JSON.stringify(individual.data));
+    assert.equal(individual.data.sentCount, 2);
+    const individualSends = hostingerMockRequests.filter((item) => item.path.endsWith('/send')).slice(sendsBefore);
+    assert.deepEqual(individualSends.map((item) => item.body.to), [['one@example.test'], ['two@example.test']]);
+    const individualWithCc = await requestJson(`${base}/send`, {
+      token: clientAlphaToken,
+      method: 'POST',
+      body: { to: ['one@example.test', 'two@example.test'], cc: ['three@example.test'], subject: 'Update', text: 'Hello', sendIndividually: true },
+    });
+    assert.equal(individualWithCc.response.status, 422);
+
+    const overviewDenied = await requestJson('/api/admin/hostinger/overview', { token: teamLeaderToken });
+    assert.equal(overviewDenied.response.status, 403);
+    const overview = await requestJson('/api/admin/hostinger/overview', { token: superAdminToken });
+    assert.equal(overview.response.status, 200, JSON.stringify(overview.data));
+    assert.equal(JSON.stringify(overview.data).includes(encryptedTokenSentinel), false);
+    const alphaRow = overview.data.mailboxes.find((mailbox) => mailbox.resourceId === 'ACclientAlpha123');
+    assert.equal(alphaRow.inHostinger, true);
+    assert.equal(alphaRow.assignment.clientId, 'client_alpha');
+    assert.equal(alphaRow.assignment.enabled, true);
+    assert.ok(alphaRow.activity.lastOpenedAt, 'opening folders is recorded as mailbox activity');
+    assert.ok(alphaRow.activity.sentLast30Days >= 3);
+    const unassignedRow = overview.data.mailboxes.find((mailbox) => mailbox.resourceId === 'ACunassigned789');
+    assert.equal(unassignedRow.assignment, null);
+    const missingRow = overview.data.mailboxes.find((mailbox) => mailbox.resourceId === 'ACclientBeta456');
+    assert.equal(missingRow.inHostinger, false, 'assignments for mailboxes no longer in Hostinger are flagged');
+
+    const stats = await requestJson('/api/admin/hostinger/mailboxes/ACclientAlpha123/stats', { token: superAdminToken });
+    assert.equal(stats.response.status, 200, JSON.stringify(stats.data));
+    assert.equal(stats.data.stats.folders.inbox.messageCount, 4);
+    assert.equal(stats.data.stats.quota.totalPercentage, 25);
 
     const unconfirmedTransfer = await requestJson('/api/admin/client-mailboxes/mailbox_alpha/reassign', {
       token: superAdminToken,

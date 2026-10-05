@@ -1,0 +1,11 @@
+{
+  "name": "@workspace/api-server",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Launches the PHP API router (artifacts/codex-dynamics/public/api) for local and Replit development.",
+  "scripts": {
+    "dev": "php -d post_max_size=32M -d upload_max_filesize=12M -S 0.0.0.0:${PORT:-8080} ../codex-dynamics/public/api/index.php",
+    "build": "php -l ../codex-dynamics/public/api/index.php",
+    "start": "php -d post_max_size=32M -d upload_max_filesize=12M -S 0.0.0.0:${PORT:-8080} ../codex-dynamics/public/api/index.php"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@workspace/scripts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:api": "node --test ./admin-api.integration.test.mjs"
+  },
+  "devDependencies": {
+    "jszip": "^3.10.2"
+  }
+}

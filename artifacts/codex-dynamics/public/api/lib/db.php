@@ -1,0 +1,1250 @@
+<?php
+/**
+ * Codex Dynamics - Database Connection & Schema Layer
+ * Designed for Hostinger Shared Hosting (PHP 8.0+ / SQLite PDO & MySQL PDO)
+ */
+
+declare(strict_types=1);
+
+// Error handling & headers
+ini_set('display_errors', '0');
+error_reporting(E_ALL);
+
+function jsonResponse(mixed $data, int $status = 200): void {
+    if (!empty($GLOBALS['clientApiContract'])) {
+        $data = mapClientApiResponse($data);
+    }
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    sendCorsHeaders();
+    echo json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** Origins allowed to call the API cross-origin, from CORS_ALLOWED_ORIGINS (comma-separated). */
+function corsAllowedOrigins(): array {
+    $configured = (string)(getenv('CORS_ALLOWED_ORIGINS') ?: '');
+    return array_values(array_filter(array_map(static fn($origin) => rtrim(trim($origin), '/'), explode(',', $configured))));
+}
+
+function requestOriginIsTrusted(): bool {
+    $origin = rtrim((string)($_SERVER['HTTP_ORIGIN'] ?? ''), '/');
+    if ($origin === '') return true;
+    $host = (string)($_SERVER['HTTP_X_FORWARDED_HOST'] ?? $_SERVER['HTTP_HOST'] ?? '');
+    $originHost = (string)parse_url($origin, PHP_URL_HOST) . (parse_url($origin, PHP_URL_PORT) ? ':' . parse_url($origin, PHP_URL_PORT) : '');
+    if ($host !== '' && strcasecmp($originHost, $host) === 0) return true;
+    return in_array($origin, corsAllowedOrigins(), true);
+}
+
+function sendCorsHeaders(): void {
+    static $sent = false;
+    if ($sent || headers_sent()) return;
+    $sent = true;
+    header('Vary: Origin');
+    $origin = rtrim((string)($_SERVER['HTTP_ORIGIN'] ?? ''), '/');
+    if ($origin === '' || !in_array($origin, corsAllowedOrigins(), true)) return;
+    header('Access-Control-Allow-Origin: ' . $origin);
+    header('Access-Control-Allow-Credentials: true');
+    header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-Chat-Token');
+}
+
+function mapClientApiResponse(mixed $value): mixed {
+    if (!is_array($value)) return $value;
+    $keys = [
+        'lead' => 'client',
+        'leads' => 'clients',
+        'lead_id' => 'client_id',
+        'lead_ids' => 'client_ids',
+        'leadId' => 'clientId',
+        'leadIds' => 'clientIds',
+        'lead_count' => 'client_count',
+        'total_leads' => 'total_clients',
+    ];
+    $mapped = [];
+    foreach ($value as $key => $item) {
+        $nextKey = is_string($key) ? ($keys[$key] ?? $key) : $key;
+        if (is_array($item)) {
+            $item = mapClientApiResponse($item);
+        } elseif (is_string($item) && in_array($key, ['error', 'message'], true)) {
+            $item = preg_replace('/\bleads\b/i', 'clients', $item);
+            $item = preg_replace('/\blead\b/i', 'client', $item);
+        }
+        $mapped[$nextKey] = $item;
+    }
+    return $mapped;
+}
+
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
+    jsonResponse(['ok' => true]);
+}
+
+function getDb(): PDO {
+    static $pdo = null;
+    if ($pdo !== null) {
+        return $pdo;
+    }
+
+    $dbHost = getenv('DB_HOST') ?: null;
+    $dbName = getenv('DB_NAME') ?: null;
+    $dbUser = getenv('DB_USER') ?: null;
+    $dbPass = getenv('DB_PASS') ?: '';
+
+    // Check optional custom config file
+    $configFile = dirname(__DIR__) . '/config.php';
+    if (file_exists($configFile)) {
+        $cfg = require $configFile;
+        if (!empty($cfg['db_host'])) $dbHost = $cfg['db_host'];
+        if (!empty($cfg['db_name'])) $dbName = $cfg['db_name'];
+        if (!empty($cfg['db_user'])) $dbUser = $cfg['db_user'];
+        if (isset($cfg['db_pass'])) $dbPass = $cfg['db_pass'];
+    }
+
+    $hasMysqlConfig = $dbHost && $dbName && $dbUser;
+    if (!$hasMysqlConfig && getenv('NODE_ENV') === 'production') {
+        error_log('Production database configuration is missing; refusing to create a local SQLite database.');
+        throw new RuntimeException('Production requires DB_HOST, DB_NAME, and DB_USER. SQLite fallback is disabled.');
+    }
+
+    $testSqliteFile = getenv('CODEX_SQLITE_PATH') ?: null;
+    if ($testSqliteFile && getenv('NODE_ENV') !== 'production') {
+        // Isolated local database path for repeatable API integration tests.
+        $testDataDir = dirname($testSqliteFile);
+        if (!is_dir($testDataDir)) {
+            @mkdir($testDataDir, 0755, true);
+        }
+        $pdo = new PDO("sqlite:{$testSqliteFile}", null, null, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        ]);
+        $pdo->exec('PRAGMA journal_mode = WAL;');
+        $pdo->exec('PRAGMA foreign_keys = ON;');
+    } elseif ($hasMysqlConfig) {
+        // MySQL connection
+        $dsn = "mysql:host={$dbHost};dbname={$dbName};charset=utf8mb4";
+        $pdo = new PDO($dsn, $dbUser, $dbPass, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ]);
+    } else {
+        // Local development fallback. Production must use a configured persistent database.
+        $dataDir = dirname(__DIR__, 3) . '/data';
+        if (!is_dir($dataDir)) {
+            @mkdir($dataDir, 0755, true);
+        }
+        $sqliteFile = $dataDir . '/codex.sqlite';
+        $pdo = new PDO("sqlite:{$sqliteFile}", null, null, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        ]);
+        $pdo->exec('PRAGMA journal_mode = WAL;');
+        $pdo->exec('PRAGMA foreign_keys = ON;');
+    }
+
+    ensureSchemaCurrent($pdo);
+    return $pdo;
+}
+
+/**
+ * Runs initSchema() only when this file (the schema definition) has changed since
+ * the last successful run, instead of on every request.
+ */
+function ensureSchemaCurrent(PDO $pdo): void {
+    $version = hash_file('sha256', __FILE__) ?: 'unknown';
+    $pdo->exec('CREATE TABLE IF NOT EXISTS schema_state (id VARCHAR(32) PRIMARY KEY, version VARCHAR(64) NOT NULL, applied_at VARCHAR(40) NOT NULL)');
+    $stmt = $pdo->prepare("SELECT version FROM schema_state WHERE id = 'schema'");
+    $stmt->execute();
+    if ($stmt->fetchColumn() === $version) return;
+    initSchema($pdo);
+    $pdo->prepare("DELETE FROM schema_state WHERE id = 'schema'")->execute();
+    $pdo->prepare("INSERT INTO schema_state (id, version, applied_at) VALUES ('schema', ?, ?)")->execute([$version, date('c')]);
+}
+
+function ensureDatabaseColumn(PDO $pdo, string $table, string $column, string $definition): void {
+    if (!preg_match('/^[A-Za-z0-9_]+$/', $table) || !preg_match('/^[A-Za-z0-9_]+$/', $column)) {
+        throw new InvalidArgumentException('Invalid schema identifier.');
+    }
+
+    if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+        $columns = array_column($pdo->query("PRAGMA table_info(`{$table}`)")->fetchAll(PDO::FETCH_ASSOC), 'name');
+        if (!in_array($column, $columns, true)) {
+            $pdo->exec("ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}");
+        }
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM `{$table}` LIKE " . $pdo->quote($column));
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}");
+    }
+}
+
+function databaseObjectType(PDO $pdo, string $name): ?string {
+    if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+        $stmt = $pdo->prepare("SELECT type FROM sqlite_master WHERE name = ? LIMIT 1");
+        $stmt->execute([$name]);
+        $type = $stmt->fetchColumn();
+        return $type === false ? null : (string)$type;
+    }
+    $stmt = $pdo->prepare('SELECT TABLE_TYPE FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1');
+    $stmt->execute([$name]);
+    $type = $stmt->fetchColumn();
+    return $type === false ? null : (strtolower((string)$type) === 'view' ? 'view' : 'table');
+}
+
+function databaseColumnNames(PDO $pdo, string $table): array {
+    if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+        throw new InvalidArgumentException('Invalid schema identifier.');
+    }
+    if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+        return array_column($pdo->query("PRAGMA table_info(`{$table}`)")->fetchAll(PDO::FETCH_ASSOC), 'name');
+    }
+    return array_column($pdo->query("SHOW COLUMNS FROM `{$table}`")->fetchAll(PDO::FETCH_ASSOC), 'Field');
+}
+
+function createLegacyClientCompatibilityView(PDO $pdo): void {
+    if (databaseObjectType($pdo, 'leads') !== null) return;
+    $driver = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+    $pdo->exec('CREATE VIEW leads AS SELECT * FROM clients');
+    if ($driver !== 'sqlite') return;
+
+    $columns = databaseColumnNames($pdo, 'clients');
+    $quotedColumns = implode(', ', array_map(static fn(string $column): string => "`{$column}`", $columns));
+    $newValues = [];
+    foreach ($columns as $column) {
+        $value = "NEW.`{$column}`";
+        if ($column === 'stage' || $column === 'status') $value = "COALESCE(NEW.`{$column}`, 'New')";
+        if ($column === 'country') $value = "COALESCE(NEW.`{$column}`, 'United Kingdom')";
+        if ($column === 'country_code') $value = "COALESCE(NEW.`{$column}`, 'GB')";
+        if ($column === 'funnel') $value = "COALESCE(NEW.`{$column}`, 'General')";
+        if ($column === 'source') $value = "COALESCE(NEW.`{$column}`, 'direct')";
+        if ($column === 'appointments' || $column === 'comment_history' || $column === 'status_history') {
+            $value = "COALESCE(NEW.`{$column}`, '[]')";
+        }
+        $newValues[] = $value;
+    }
+    $updates = [];
+    foreach ($columns as $column) {
+        if ($column === 'id') continue;
+        $updates[] = "`{$column}` = NEW.`{$column}`";
+    }
+
+    $pdo->exec("CREATE TRIGGER leads_compat_insert INSTEAD OF INSERT ON leads BEGIN
+        INSERT INTO clients ({$quotedColumns}) VALUES (" . implode(', ', $newValues) . ");
+    END");
+    $pdo->exec("CREATE TRIGGER leads_compat_update INSTEAD OF UPDATE ON leads BEGIN
+        UPDATE clients SET " . implode(', ', $updates) . " WHERE id = OLD.id;
+    END");
+    $pdo->exec("CREATE TRIGGER leads_compat_delete INSTEAD OF DELETE ON leads BEGIN
+        DELETE FROM clients WHERE id = OLD.id;
+    END");
+}
+
+function migrateLegacyClientIdentity(PDO $pdo): void {
+    $migrationId = 'canonical_clients_and_portal_access_v1';
+    $check = $pdo->prepare('SELECT id FROM schema_migrations WHERE id = ?');
+    $check->execute([$migrationId]);
+    if (!$check->fetchColumn()) {
+        $driver = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+        $legacyLeadType = databaseObjectType($pdo, 'leads');
+        if ($legacyLeadType === 'table') {
+            $legacyColumns = databaseColumnNames($pdo, 'leads');
+            $clientColumns = array_flip(databaseColumnNames($pdo, 'clients'));
+            $copyColumns = array_values(array_filter($legacyColumns, static fn(string $column): bool =>
+                isset($clientColumns[$column]) && $column !== 'client_password'
+            ));
+            $quoted = implode(', ', array_map(static fn(string $column): string => "`{$column}`", $copyColumns));
+            $rows = $pdo->query("SELECT {$quoted}, " . (in_array('client_password', $legacyColumns, true) ? '`client_password`' : "'' AS `client_password`") . " FROM leads")->fetchAll(PDO::FETCH_ASSOC);
+            $insert = $pdo->prepare("INSERT INTO clients ({$quoted}) VALUES (" . implode(', ', array_fill(0, count($copyColumns), '?')) . ")");
+            $findClient = $pdo->prepare('SELECT id FROM clients WHERE id = ?');
+            $legacyPasswordRows = [];
+            foreach ($rows as $row) {
+                $findClient->execute([$row['id']]);
+                if (!$findClient->fetchColumn()) {
+                    $insert->execute(array_map(static fn(string $column) => $row[$column] ?? null, $copyColumns));
+                }
+                if (trim((string)($row['client_password'] ?? '')) !== '') $legacyPasswordRows[] = $row;
+            }
+            if ($driver === 'sqlite') {
+                $pdo->exec('ALTER TABLE leads RENAME TO legacy_leads');
+            } else {
+                $pdo->exec('RENAME TABLE leads TO legacy_leads');
+            }
+
+            $saveLegacyPassword = $pdo->prepare('UPDATE legacy_leads SET client_password = NULL WHERE id = ?');
+            foreach ($legacyPasswordRows as $row) {
+                $legacyPassword = (string)$row['client_password'];
+                $passwordInfo = password_get_info($legacyPassword);
+                $passwordHash = ($passwordInfo['algo'] ?? null) !== null
+                    ? $legacyPassword
+                    : password_hash($legacyPassword, PASSWORD_DEFAULT);
+                if ($passwordHash === false) throw new RuntimeException('Could not securely migrate a legacy portal password.');
+                $access = $pdo->prepare('SELECT client_id FROM client_portal_access WHERE client_id = ?');
+                $access->execute([(string)$row['id']]);
+                if (!$access->fetchColumn()) {
+                    $pdo->prepare("INSERT INTO client_portal_access (client_id, password_hash, status, portal_enabled, created_at)
+                        VALUES (?, ?, 'Active', 1, ?)")
+                        ->execute([(string)$row['id'], $passwordHash, (string)($row['created_at'] ?? date('c'))]);
+                }
+                $saveLegacyPassword->execute([(string)$row['id']]);
+            }
+        }
+
+        if (databaseObjectType($pdo, 'legacy_portal_clients') === null && databaseObjectType($pdo, 'portal_clients') === 'table') {
+            $portalRows = $pdo->query('SELECT * FROM portal_clients')->fetchAll(PDO::FETCH_ASSOC);
+            $clientColumns = array_flip(databaseColumnNames($pdo, 'clients'));
+            $findClient = $pdo->prepare('SELECT id FROM clients WHERE id = ?');
+            $insertClient = $pdo->prepare('INSERT INTO clients (id, first_name, last_name, name, email, phone, address, country, country_code, company, stage, status, source, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+            $savePortal = $pdo->prepare('INSERT INTO client_portal_access
+                (client_id, password_hash, status, portal_enabled, tier, last_login_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)');
+            $hasPortalAccess = $pdo->prepare('SELECT client_id FROM client_portal_access WHERE client_id = ?');
+            foreach ($portalRows as $row) {
+                $clientId = (string)$row['id'];
+                $findClient->execute([$clientId]);
+                if (!$findClient->fetchColumn()) {
+                    $name = trim((string)($row['name'] ?? ''));
+                    $nameParts = preg_split('/\s+/', $name, 2) ?: [];
+                    $insertClient->execute([
+                        $clientId,
+                        $nameParts[0] ?? '',
+                        $nameParts[1] ?? '',
+                        $name,
+                        $row['email'] ?? null,
+                        $row['phone'] ?? null,
+                        $row['address'] ?? null,
+                        $row['country'] ?? 'United Kingdom',
+                        $row['country_code'] ?? 'GB',
+                        $row['company'] ?? null,
+                        'Active',
+                        $row['status'] ?? 'Active',
+                        'portal_migration',
+                        $row['created_at'] ?? date('c'),
+                        $row['created_at'] ?? date('c'),
+                    ]);
+                } else {
+                    $client = $pdo->prepare('SELECT name, company, email, phone FROM clients WHERE id = ?');
+                    $client->execute([$clientId]);
+                    $existing = $client->fetch(PDO::FETCH_ASSOC) ?: [];
+                    $updates = [];
+                    $params = [];
+                    foreach (['name', 'company', 'email', 'phone', 'address'] as $field) {
+                        if (empty($existing[$field]) && !empty($row[$field]) && isset($clientColumns[$field])) {
+                            $updates[] = "`{$field}` = ?";
+                            $params[] = $row[$field];
+                        }
+                    }
+                    if ($updates) {
+                        $params[] = $clientId;
+                        $pdo->prepare('UPDATE clients SET ' . implode(', ', $updates) . ' WHERE id = ?')->execute($params);
+                    }
+                }
+                $passwordInfo = password_get_info((string)($row['password'] ?? ''));
+                $passwordHash = trim((string)($row['password'] ?? '')) === ''
+                    ? ''
+                    : ((($passwordInfo['algo'] ?? null) !== null) ? (string)$row['password'] : (string)(password_hash((string)$row['password'], PASSWORD_DEFAULT) ?: ''));
+                $hasPortalAccess->execute([$clientId]);
+                if ($hasPortalAccess->fetchColumn()) {
+                    $accessPassword = $passwordHash !== '' ? $passwordHash : null;
+                    $pdo->prepare("UPDATE client_portal_access SET
+                        password_hash = COALESCE(?, password_hash),
+                        status = ?, portal_enabled = ?, tier = ?, last_login_at = ?
+                        WHERE client_id = ?")
+                        ->execute([
+                            $accessPassword,
+                            (string)($row['status'] ?? 'Active'),
+                            (int)($row['portal_enabled'] ?? 1),
+                            $row['tier'] ?? null,
+                            $row['last_login_at'] ?? null,
+                            $clientId,
+                        ]);
+                } else {
+                    $savePortal->execute([
+                        $clientId,
+                        $passwordHash,
+                        (string)($row['status'] ?? 'Active'),
+                        (int)($row['portal_enabled'] ?? 1),
+                        $row['tier'] ?? null,
+                        $row['last_login_at'] ?? null,
+                        $row['created_at'] ?? date('c'),
+                    ]);
+                }
+            }
+            if ($driver === 'sqlite') {
+                $pdo->exec('ALTER TABLE portal_clients RENAME TO legacy_portal_clients');
+            } else {
+                $pdo->exec('RENAME TABLE portal_clients TO legacy_portal_clients');
+            }
+        }
+
+        if ($driver === 'sqlite') {
+            $duplicatePairs = $pdo->prepare("INSERT OR IGNORE INTO client_identity_reviews (client_id_a, client_id_b, reason, status, created_at)
+                SELECT a.id, b.id, 'Duplicate normalized email in legacy records; identity was not merged.', 'pending', ?
+                FROM clients a
+                JOIN clients b ON a.id < b.id
+                  AND LOWER(TRIM(COALESCE(a.email, ''))) = LOWER(TRIM(COALESCE(b.email, '')))
+                WHERE TRIM(COALESCE(a.email, '')) <> ''");
+            $duplicatePairs->execute([date('c')]);
+        } else {
+            $duplicateGroups = $pdo->query("SELECT LOWER(TRIM(email)) AS normalized_email
+                FROM clients WHERE email IS NOT NULL AND TRIM(email) <> ''
+                GROUP BY LOWER(TRIM(email)) HAVING COUNT(*) > 1")->fetchAll(PDO::FETCH_COLUMN);
+            foreach ($duplicateGroups as $email) {
+                $stmt = $pdo->prepare("SELECT id FROM clients WHERE LOWER(TRIM(email)) = ? ORDER BY id");
+                $stmt->execute([$email]);
+                $ids = $stmt->fetchAll(PDO::FETCH_COLUMN);
+                for ($i = 0; $i < count($ids); $i++) {
+                    for ($j = $i + 1; $j < count($ids); $j++) {
+                        $pdo->prepare("INSERT INTO client_identity_reviews (client_id_a, client_id_b, reason, status, created_at)
+                            VALUES (?, ?, 'Duplicate normalized email in legacy records; identity was not merged.', 'pending', ?)")
+                            ->execute([$ids[$i], $ids[$j], date('c')]);
+                    }
+                }
+            }
+        }
+        $pdo->prepare('INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)')->execute([$migrationId, date('c')]);
+    }
+
+    createLegacyClientCompatibilityView($pdo);
+}
+
+function initSchema(PDO $pdo): void {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS platform_settings (
+            id VARCHAR(64) PRIMARY KEY,
+            settings_json MEDIUMTEXT NOT NULL,
+            site_config_json MEDIUMTEXT NULL,
+            updated_by VARCHAR(128),
+            updated_at VARCHAR(40) NOT NULL
+        )
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS newsletter_subscribers (
+            id VARCHAR(64) PRIMARY KEY,
+            email VARCHAR(320) NOT NULL UNIQUE,
+            source VARCHAR(128) NOT NULL,
+            subscribed_at VARCHAR(40) NOT NULL
+        )
+    ");
+
+    // Canonical Client identity. The leads view is retained temporarily for old integrations.
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS clients (
+            id VARCHAR(191) PRIMARY KEY,
+            first_name TEXT,
+            last_name TEXT,
+            name TEXT,
+            email TEXT,
+            phone TEXT,
+            address TEXT,
+            country TEXT DEFAULT 'United Kingdom',
+            country_code TEXT DEFAULT 'GB',
+            stage TEXT DEFAULT 'New',
+            status TEXT DEFAULT 'New',
+            funnel TEXT DEFAULT 'General',
+            company TEXT,
+            service TEXT,
+            budget TEXT,
+            timeline TEXT,
+            message TEXT,
+            source TEXT DEFAULT 'direct',
+            notes TEXT,
+            assigned_office_id TEXT,
+            assigned_team_id TEXT,
+            assigned_team_leader_id TEXT,
+            assigned_agent_id TEXT,
+            assigned_by TEXT,
+            is_online INTEGER DEFAULT 0,
+            comment_history TEXT,
+            status_history TEXT,
+            appointments TEXT,
+            activity_record TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
+    ");
+    // Keep soft-deleted Clients out of the active CRM while allowing admins to
+    // restore them. Existing SQLite/MySQL installs gain the nullable column
+    // without replacing or rebuilding their current lead data.
+    if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+        $clientColumns = array_column($pdo->query('PRAGMA table_info(clients)')->fetchAll(PDO::FETCH_ASSOC), 'name');
+        if (!in_array('deleted_at', $clientColumns, true)) {
+            $pdo->exec('ALTER TABLE clients ADD COLUMN deleted_at TEXT');
+        }
+    } else {
+        $column = $pdo->query("SHOW COLUMNS FROM clients LIKE 'deleted_at'")->fetch();
+        if (!$column) {
+            $pdo->exec('ALTER TABLE clients ADD COLUMN deleted_at TEXT NULL');
+        }
+    }
+    if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+        $clientColumns = array_column($pdo->query('PRAGMA table_info(clients)')->fetchAll(PDO::FETCH_ASSOC), 'name');
+        if (!in_array('assigned_team_leader_id', $clientColumns, true)) {
+            $pdo->exec('ALTER TABLE clients ADD COLUMN assigned_team_leader_id TEXT');
+        }
+    } else {
+        $column = $pdo->query("SHOW COLUMNS FROM clients LIKE 'assigned_team_leader_id'")->fetch();
+        if (!$column) {
+            $pdo->exec('ALTER TABLE clients ADD COLUMN assigned_team_leader_id TEXT NULL');
+        }
+    }
+    ensureDatabaseColumn($pdo, 'clients', 'address', 'TEXT NULL');
+
+    // Portal access belongs to a Client; it is not a second identity.
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_portal_access (
+            client_id VARCHAR(191) PRIMARY KEY,
+            password_hash VARCHAR(255),
+            status TEXT DEFAULT 'Active',
+            portal_enabled INTEGER DEFAULT 1,
+            tier TEXT DEFAULT 'Enterprise Partner',
+            last_login_at TEXT,
+            created_at TEXT
+        );
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_identity_reviews (
+            client_id_a VARCHAR(191) NOT NULL,
+            client_id_b VARCHAR(191) NOT NULL,
+            reason TEXT NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'pending',
+            created_at VARCHAR(40) NOT NULL,
+            PRIMARY KEY (client_id_a, client_id_b)
+        )
+    ");
+
+    // 3. Notifications Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS notifications (
+            id TEXT PRIMARY KEY,
+            user_id TEXT, -- NULL means broadcast to all clients
+            title TEXT,
+            description TEXT,
+            kind TEXT DEFAULT 'info',
+            type TEXT DEFAULT 'project',
+            is_read INTEGER DEFAULT 0,
+            link TEXT,
+            sent_by TEXT DEFAULT 'Admin',
+            created_at TEXT
+        );
+    ");
+
+    // 4. Chat Messages Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            sender TEXT NOT NULL, -- 'agent' or 'client'
+            sender_name TEXT,
+            body TEXT NOT NULL,
+            attachment_name TEXT,
+            attachment_path TEXT,
+            is_read INTEGER DEFAULT 0,
+            created_at TEXT
+        );
+    ");
+    ensureDatabaseColumn($pdo, 'messages', 'attachment_mime', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'messages', 'attachment_kind', 'TEXT NULL');
+
+    // 5. Audit Log (Activity) Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            client_name TEXT,
+            action TEXT NOT NULL,
+            details TEXT,
+            ip_address TEXT,
+            created_at TEXT
+        );
+    ");
+
+    // 6. Portfolio Projects Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            site_name TEXT,
+            site_url TEXT,
+            description TEXT,
+            category TEXT DEFAULT 'Websites & Web Apps',
+            image_url TEXT,
+            is_published INTEGER DEFAULT 1,
+            created_at TEXT
+        );
+    ");
+
+    // 7. Blog Posts Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS blogs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            slug TEXT UNIQUE,
+            content TEXT,
+            excerpt TEXT,
+            category TEXT DEFAULT 'Engineering',
+            author TEXT DEFAULT 'Codex Team',
+            status TEXT DEFAULT 'published',
+            featured_image TEXT,
+            meta_description TEXT,
+            reading_time INTEGER DEFAULT 5,
+            created_at TEXT,
+            updated_at TEXT
+        );
+    ");
+
+    // 8. Reviews Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            author TEXT NOT NULL,
+            rating INTEGER DEFAULT 5,
+            comment TEXT,
+            is_published INTEGER DEFAULT 1,
+            created_at TEXT
+        );
+    ");
+
+    // 9. Backlinks Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS backlinks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            notes TEXT,
+            created_at TEXT
+        );
+    ");
+
+    // 10. Staff Users Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS staff_users (
+            id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            name TEXT NOT NULL,
+            role TEXT NOT NULL,
+            office_id TEXT,
+            team_id TEXT,
+            status TEXT DEFAULT 'Active',
+            capabilities TEXT,
+            last_login_at TEXT,
+            created_at TEXT,
+            deleted_at TEXT,
+            deleted_scope_type TEXT,
+            deleted_scope_id TEXT
+        );
+    ");
+    ensureDatabaseColumn($pdo, 'staff_users', 'deleted_at', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'staff_users', 'deleted_scope_type', 'VARCHAR(16) NULL');
+    ensureDatabaseColumn($pdo, 'staff_users', 'deleted_scope_id', 'VARCHAR(128) NULL');
+
+    // Migrate legacy staff passwords once. New writes are hashed at the API
+    // boundary; this preserves existing passwords while removing plaintext
+    // values from the database.
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            id VARCHAR(100) PRIMARY KEY,
+            applied_at VARCHAR(40) NOT NULL
+        )
+    ");
+    $passwordMigration = 'hash_legacy_staff_passwords_v1';
+    $migrationCheck = $pdo->prepare('SELECT id FROM schema_migrations WHERE id = ?');
+    $migrationCheck->execute([$passwordMigration]);
+    if (!$migrationCheck->fetchColumn()) {
+        $legacyPasswords = $pdo->query('SELECT id, password FROM staff_users')->fetchAll(PDO::FETCH_ASSOC);
+        $savePassword = $pdo->prepare('UPDATE staff_users SET password = ? WHERE id = ?');
+        foreach ($legacyPasswords as $legacyPassword) {
+            $passwordInfo = password_get_info((string)$legacyPassword['password']);
+            if (($passwordInfo['algo'] ?? null) !== null) continue;
+            $hash = password_hash((string)$legacyPassword['password'], PASSWORD_DEFAULT);
+            if ($hash === false) throw new RuntimeException('Could not securely migrate a staff password.');
+            $savePassword->execute([$hash, $legacyPassword['id']]);
+        }
+        $pdo->prepare('INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)')
+            ->execute([$passwordMigration, date('c')]);
+    }
+
+    // 11. Client Websites Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_websites (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            website_url TEXT NOT NULL,
+            back_office_url TEXT NOT NULL,
+            status TEXT DEFAULT 'Active',
+            connection_status TEXT DEFAULT 'Connected',
+            connector_id TEXT,
+            connector_secret TEXT,
+            access_enabled INTEGER DEFAULT 1,
+            tech_stack TEXT,
+            hosting_plan TEXT,
+            ssl_status TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
+    ");
+
+    // 12. Client Projects Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_projects (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            service TEXT,
+            status TEXT DEFAULT 'In Progress',
+            progress INTEGER DEFAULT 0,
+            start_date TEXT,
+            target_date TEXT,
+            team_lead TEXT,
+            milestones TEXT,
+            recent_updates TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
+    ");
+
+    // 13. Client Invoices Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_invoices (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            invoice_number TEXT NOT NULL,
+            issue_date TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            paid_date TEXT,
+            status TEXT DEFAULT 'Pending',
+            currency TEXT DEFAULT 'USD',
+            subtotal REAL DEFAULT 0,
+            tax REAL DEFAULT 0,
+            total REAL DEFAULT 0,
+            amount_paid REAL DEFAULT 0,
+            balance_due REAL DEFAULT 0,
+            payment_method TEXT,
+            line_items TEXT,
+            notes TEXT,
+            created_at TEXT
+        );
+    ");
+
+    // 14. Client Payments Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_payments (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            invoice_id TEXT,
+            receipt_number TEXT NOT NULL,
+            payment_date TEXT NOT NULL,
+            amount REAL DEFAULT 0,
+            currency VARCHAR(3) DEFAULT 'USD',
+            payment_method TEXT,
+            transaction_reference TEXT,
+            description TEXT,
+            status TEXT DEFAULT 'Completed',
+            created_at TEXT
+        );
+    ");
+    if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+        $paymentColumns = array_column($pdo->query('PRAGMA table_info(client_payments)')->fetchAll(PDO::FETCH_ASSOC), 'name');
+        if (!in_array('currency', $paymentColumns, true)) {
+            $pdo->exec("ALTER TABLE client_payments ADD COLUMN currency VARCHAR(3) DEFAULT 'USD'");
+        }
+    } else {
+        $currencyColumn = $pdo->query("SHOW COLUMNS FROM client_payments LIKE 'currency'")->fetch();
+        if (!$currencyColumn) $pdo->exec("ALTER TABLE client_payments ADD COLUMN currency VARCHAR(3) DEFAULT 'USD'");
+    }
+    ensureDatabaseColumn($pdo, 'client_payments', 'void_reason', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'client_payments', 'voided_by', 'VARCHAR(191) NULL');
+    ensureDatabaseColumn($pdo, 'client_payments', 'voided_at', 'TEXT NULL');
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_invoice_followups (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            invoice_id TEXT NOT NULL,
+            contact_date TEXT NOT NULL,
+            contact_method TEXT NOT NULL,
+            note TEXT NOT NULL,
+            next_follow_up_date TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL
+        );
+    ");
+    if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_invoice_followups_client_date ON client_invoice_followups (client_id, contact_date)');
+    } else {
+        $followupIndex = $pdo->query("SHOW INDEX FROM client_invoice_followups WHERE Key_name = 'idx_invoice_followups_client_date'")->fetch();
+        if (!$followupIndex) $pdo->exec('CREATE INDEX idx_invoice_followups_client_date ON client_invoice_followups (client_id, contact_date)');
+    }
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_recurring_services (
+            id VARCHAR(191) PRIMARY KEY,
+            client_id VARCHAR(191) NOT NULL,
+            service_name VARCHAR(191) NOT NULL,
+            service_type VARCHAR(64) NOT NULL DEFAULT 'Other',
+            description TEXT,
+            amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+            currency VARCHAR(3) NOT NULL DEFAULT 'USD',
+            billing_frequency VARCHAR(16) NOT NULL DEFAULT 'Monthly',
+            start_date DATE NOT NULL,
+            next_due_date DATE NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'Active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    ");
+
+    // Client credentials are encrypted by the API before they are stored.
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_access_credentials (
+            client_id VARCHAR(191) PRIMARY KEY,
+            website_url TEXT,
+            website_username TEXT,
+            website_password_enc TEXT,
+            email_address TEXT,
+            webmail_url TEXT,
+            email_password_enc TEXT,
+            imap_host TEXT,
+            imap_port INTEGER DEFAULT 993,
+            smtp_host TEXT,
+            smtp_port INTEGER DEFAULT 465,
+            updated_at TEXT
+        );
+    ");
+
+    // Global Hostinger Mail API credential and normalized client mailbox
+    // assignments. The token value is always encrypted by the API layer.
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS hostinger_mail_integrations (
+            id VARCHAR(64) PRIMARY KEY,
+            encrypted_token TEXT NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'connected',
+            last_tested_at VARCHAR(40),
+            last_success_at VARCHAR(40),
+            last_error_code VARCHAR(128),
+            mailbox_count INTEGER NOT NULL DEFAULT 0,
+            order_resource_id VARCHAR(191),
+            created_by VARCHAR(191),
+            updated_by VARCHAR(191),
+            created_at VARCHAR(40) NOT NULL,
+            updated_at VARCHAR(40) NOT NULL
+        );
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_mailboxes (
+            id VARCHAR(191) PRIMARY KEY,
+            client_id VARCHAR(191) NOT NULL,
+            provider VARCHAR(32) NOT NULL DEFAULT 'hostinger',
+            provider_mailbox_id VARCHAR(191) NOT NULL UNIQUE,
+            email_address VARCHAR(320) NOT NULL,
+            display_name VARCHAR(191) NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'enabled',
+            created_by VARCHAR(191),
+            created_at VARCHAR(40) NOT NULL,
+            updated_at VARCHAR(40) NOT NULL
+        );
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_mail_drafts (
+            id VARCHAR(191) PRIMARY KEY,
+            client_id VARCHAR(191) NOT NULL,
+            provider_mailbox_id VARCHAR(191) NOT NULL,
+            draft_json MEDIUMTEXT NOT NULL,
+            created_at VARCHAR(40) NOT NULL,
+            updated_at VARCHAR(40) NOT NULL
+        );
+    ");
+    if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_client_mailboxes_client_status ON client_mailboxes (client_id, status)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_client_mail_drafts_owner_mailbox ON client_mail_drafts (client_id, provider_mailbox_id, updated_at)');
+    } else {
+        $mailboxIndex = $pdo->query("SHOW INDEX FROM client_mailboxes WHERE Key_name = 'idx_client_mailboxes_client_status'")->fetch();
+        if (!$mailboxIndex) $pdo->exec('CREATE INDEX idx_client_mailboxes_client_status ON client_mailboxes (client_id, status)');
+        $draftIndex = $pdo->query("SHOW INDEX FROM client_mail_drafts WHERE Key_name = 'idx_client_mail_drafts_owner_mailbox'")->fetch();
+        if (!$draftIndex) $pdo->exec('CREATE INDEX idx_client_mail_drafts_owner_mailbox ON client_mail_drafts (client_id, provider_mailbox_id, updated_at)');
+    }
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_profile_permissions (
+            client_id VARCHAR(191) NOT NULL,
+            staff_id VARCHAR(191) NOT NULL,
+            profile_section VARCHAR(32) NOT NULL,
+            access_level VARCHAR(16) NOT NULL,
+            granted_by VARCHAR(191) NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (client_id, staff_id, profile_section)
+        );
+    ");
+
+    // 15. Client Hosting Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_hosting (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            website_id TEXT,
+            website_name TEXT,
+            provider TEXT,
+            plan TEXT,
+            status TEXT DEFAULT 'Active',
+            start_date TEXT,
+            renewal_date TEXT,
+            billing_frequency TEXT DEFAULT 'Monthly',
+            amount REAL DEFAULT 0,
+            currency VARCHAR(3) DEFAULT 'USD',
+            auto_renew INTEGER DEFAULT 1,
+            server_region TEXT,
+            ip_address TEXT,
+            uptime TEXT DEFAULT '99.99%'
+        );
+    ");
+    ensureDatabaseColumn($pdo, 'client_hosting', 'currency', "VARCHAR(3) DEFAULT 'USD'");
+
+    // 16. Client Domains Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_domains (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            domain_name TEXT NOT NULL,
+            registrar TEXT DEFAULT 'Codex Managed',
+            registration_date TEXT,
+            expiration_date TEXT,
+            renewal_amount DECIMAL(12,2) NULL,
+            currency VARCHAR(3) DEFAULT 'USD',
+            renewal_status TEXT DEFAULT 'Auto-Renew Active',
+            auto_renew INTEGER DEFAULT 1,
+            dns_management INTEGER DEFAULT 1,
+            nameservers TEXT,
+            records TEXT
+        );
+    ");
+    ensureDatabaseColumn($pdo, 'client_domains', 'renewal_amount', 'DECIMAL(12,2) NULL');
+    ensureDatabaseColumn($pdo, 'client_domains', 'currency', "VARCHAR(3) DEFAULT 'USD'");
+
+    // 17. Client Support Tickets Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_support_tickets (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            ticket_number TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            category TEXT DEFAULT 'General',
+            priority TEXT DEFAULT 'Medium',
+            status TEXT DEFAULT 'Open',
+            assigned_agent TEXT,
+            messages TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
+    ");
+
+    // 18. Client Files Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_files (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            category TEXT DEFAULT 'Deliverables',
+            size TEXT,
+            uploaded_at TEXT,
+            file_type TEXT,
+            download_url TEXT
+        );
+    ");
+
+    // 19. Offices Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS offices (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            manager_id TEXT,
+            manager_name TEXT,
+            manager_email TEXT,
+            created_at TEXT,
+            deleted_at TEXT,
+            deleted_scope_type TEXT,
+            deleted_scope_id TEXT
+        );
+    ");
+    ensureDatabaseColumn($pdo, 'offices', 'deleted_at', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'offices', 'deleted_scope_type', 'VARCHAR(16) NULL');
+    ensureDatabaseColumn($pdo, 'offices', 'deleted_scope_id', 'VARCHAR(128) NULL');
+
+    // 20. Teams Table
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS teams (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            office_id TEXT,
+            leader_id TEXT,
+            leader_name TEXT,
+            max_size INTEGER DEFAULT 10,
+            created_at TEXT,
+            deleted_at TEXT,
+            deleted_scope_type TEXT,
+            deleted_scope_id TEXT
+        );
+    ");
+    ensureDatabaseColumn($pdo, 'teams', 'deleted_at', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'teams', 'deleted_scope_type', 'VARCHAR(16) NULL');
+    ensureDatabaseColumn($pdo, 'teams', 'deleted_scope_id', 'VARCHAR(128) NULL');
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS crm_assignment_restore (
+            id VARCHAR(128) PRIMARY KEY,
+            entity_type VARCHAR(16) NOT NULL,
+            entity_id VARCHAR(128) NOT NULL,
+            lead_id VARCHAR(128) NOT NULL,
+            assigned_office_id VARCHAR(128),
+            assigned_team_id VARCHAR(128),
+            assigned_team_leader_id VARCHAR(128),
+            assigned_agent_id VARCHAR(128),
+            assigned_by VARCHAR(128)
+        );
+        CREATE TABLE IF NOT EXISTS lead_assignment_history (
+            id VARCHAR(128) PRIMARY KEY,
+            lead_id VARCHAR(128) NOT NULL,
+            actor_id VARCHAR(128) NOT NULL,
+            previous_assignment TEXT NOT NULL,
+            new_assignment TEXT NOT NULL,
+            created_at VARCHAR(40) NOT NULL
+        )
+    ");
+
+    // Business data is created through the API. Do not repopulate deleted records
+    // with sample rows when the database is empty.
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+            token_hash TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NULL
+        );
+        CREATE TABLE IF NOT EXISTS portal_sessions (
+            token_hash TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            is_impersonating INTEGER NOT NULL DEFAULT 0,
+            admin_user_id TEXT NULL
+        );
+        CREATE TABLE IF NOT EXISTS user_notification_reads (
+            user_id TEXT NOT NULL,
+            notification_id TEXT NOT NULL,
+            read_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, notification_id)
+        );
+        CREATE TABLE IF NOT EXISTS admin_notifications (
+            id VARCHAR(128) PRIMARY KEY,
+            staff_user_id VARCHAR(128) NOT NULL,
+            kind VARCHAR(64) NOT NULL DEFAULT 'info',
+            title VARCHAR(255) NOT NULL,
+            body TEXT,
+            read_at TEXT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS crm_message_presence (
+            client_id VARCHAR(128) NOT NULL,
+            actor_type VARCHAR(16) NOT NULL,
+            actor_id VARCHAR(128) NOT NULL,
+            is_typing INTEGER NOT NULL DEFAULT 0,
+            last_seen_at TEXT NOT NULL,
+            PRIMARY KEY (client_id, actor_type, actor_id)
+        );
+        CREATE TABLE IF NOT EXISTS signup_requests (
+            id VARCHAR(128) PRIMARY KEY,
+            name TEXT NOT NULL,
+            email VARCHAR(255) NOT NULL,
+            request_data TEXT NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'pending',
+            rejection_reason TEXT,
+            verification_code_hash TEXT,
+            verification_expires_at TEXT,
+            verification_attempts INTEGER NOT NULL DEFAULT 0,
+            client_id VARCHAR(128),
+            lead_id VARCHAR(128),
+            created_at TEXT NOT NULL,
+            reviewed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS password_reset_requests (
+            user_id VARCHAR(128) PRIMARY KEY,
+            requested_at TEXT NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'pending',
+            code_hash TEXT,
+            expires_at TEXT,
+            sent_at TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS client_workspaces (
+            user_id VARCHAR(128) PRIMARY KEY,
+            workspace_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    ");
+    ensureDatabaseColumn($pdo, 'admin_sessions', 'last_seen_at', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'portal_sessions', 'is_impersonating', 'INTEGER NOT NULL DEFAULT 0');
+    ensureDatabaseColumn($pdo, 'portal_sessions', 'admin_user_id', 'TEXT NULL');
+    migrateLegacyClientIdentity($pdo);
+
+    // Keep the rich portfolio editor and the public portfolio on the same
+    // project row as the standard Site CRM editor.
+    ensureDatabaseColumn($pdo, 'projects', 'showcase_json', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'projects', 'deleted_at', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'blogs', 'deleted_at', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'reviews', 'deleted_at', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'backlinks', 'deleted_at', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'client_projects', 'deleted_at', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'clients', 'merged_into_client_id', 'TEXT NULL');
+    ensureDatabaseColumn($pdo, 'client_identity_reviews', 'reviewed_by', 'VARCHAR(191) NULL');
+    ensureDatabaseColumn($pdo, 'client_identity_reviews', 'reviewed_at', 'VARCHAR(40) NULL');
+    ensureDatabaseColumn($pdo, 'client_identity_reviews', 'resolution', 'TEXT NULL');
+
+    $driver = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+    if ($driver === 'sqlite') {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS blog_categories (
+                id VARCHAR(191) PRIMARY KEY,
+                name VARCHAR(191) NOT NULL,
+                slug VARCHAR(191) NOT NULL UNIQUE,
+                parent VARCHAR(191) NULL,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at VARCHAR(40) NOT NULL,
+                updated_at VARCHAR(40) NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS visitor_chat_sessions (
+                token_hash VARCHAR(64) PRIMARY KEY,
+                client_id VARCHAR(191) NOT NULL REFERENCES clients(id),
+                created_at VARCHAR(40) NOT NULL,
+                last_message_at VARCHAR(40) NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_visitor_chat_sessions_client
+                ON visitor_chat_sessions (client_id);
+            CREATE TABLE IF NOT EXISTS staff_notes (
+                id VARCHAR(191) PRIMARY KEY,
+                staff_id VARCHAR(191) NOT NULL REFERENCES staff_users(id),
+                created_by_staff_id VARCHAR(191) NOT NULL REFERENCES staff_users(id),
+                body TEXT NOT NULL,
+                created_at VARCHAR(40) NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_staff_notes_staff_created
+                ON staff_notes (staff_id, created_at);
+            CREATE TABLE IF NOT EXISTS client_chat_metadata (
+                client_id VARCHAR(191) PRIMARY KEY REFERENCES clients(id),
+                assigned_staff_id VARCHAR(191) NULL REFERENCES staff_users(id),
+                status VARCHAR(24) NOT NULL DEFAULT 'active',
+                is_archived INTEGER NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+                updated_at VARCHAR(40) NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS site_content_imports (
+                source_key VARCHAR(255) PRIMARY KEY,
+                record_type VARCHAR(32) NOT NULL,
+                record_id VARCHAR(191) NOT NULL,
+                imported_at VARCHAR(40) NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS client_chat_imports (
+                source_key VARCHAR(255) PRIMARY KEY,
+                client_id VARCHAR(191) NOT NULL REFERENCES clients(id),
+                message_id VARCHAR(191) NOT NULL,
+                imported_at VARCHAR(40) NOT NULL
+            );
+        ");
+
+        // Legacy business tables predate declared foreign keys. Guard new
+        // references at the database boundary without rebuilding user tables.
+        $clientIdTables = $pdo->query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+            ->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($clientIdTables as $table) {
+            if ($table === 'clients' || !in_array('client_id', databaseColumnNames($pdo, (string)$table), true)) continue;
+            $tableName = (string)$table;
+            $triggerKey = preg_replace('/[^A-Za-z0-9_]/', '_', $tableName);
+            $pdo->exec("CREATE TRIGGER IF NOT EXISTS guard_{$triggerKey}_client_insert
+                BEFORE INSERT ON `{$tableName}`
+                WHEN NEW.client_id IS NOT NULL AND NEW.client_id <> ''
+                    AND NOT EXISTS (SELECT 1 FROM clients WHERE id = NEW.client_id)
+                BEGIN SELECT RAISE(ABORT, 'Unknown Client identity'); END");
+            $pdo->exec("CREATE TRIGGER IF NOT EXISTS guard_{$triggerKey}_client_update
+                BEFORE UPDATE OF client_id ON `{$tableName}`
+                WHEN NEW.client_id IS NOT NULL AND NEW.client_id <> ''
+                    AND NOT EXISTS (SELECT 1 FROM clients WHERE id = NEW.client_id)
+                BEGIN SELECT RAISE(ABORT, 'Unknown Client identity'); END");
+        }
+    } else {
+        // MySQL installs use application-level ownership validation because
+        // legacy tables use mixed key widths that cannot be safely rebuilt
+        // without an explicit database migration window.
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS blog_categories (
+                id VARCHAR(191) PRIMARY KEY,
+                name VARCHAR(191) NOT NULL,
+                slug VARCHAR(191) NOT NULL UNIQUE,
+                parent VARCHAR(191) NULL,
+                is_default TINYINT(1) NOT NULL DEFAULT 0,
+                created_at VARCHAR(40) NOT NULL,
+                updated_at VARCHAR(40) NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS visitor_chat_sessions (
+                token_hash VARCHAR(64) PRIMARY KEY,
+                client_id VARCHAR(191) NOT NULL,
+                created_at VARCHAR(40) NOT NULL,
+                last_message_at VARCHAR(40) NULL,
+                INDEX idx_visitor_chat_sessions_client (client_id)
+            );
+            CREATE TABLE IF NOT EXISTS staff_notes (
+                id VARCHAR(191) PRIMARY KEY,
+                staff_id VARCHAR(191) NOT NULL,
+                created_by_staff_id VARCHAR(191) NOT NULL,
+                body TEXT NOT NULL,
+                created_at VARCHAR(40) NOT NULL,
+                INDEX idx_staff_notes_staff_created (staff_id, created_at)
+            );
+            CREATE TABLE IF NOT EXISTS client_chat_metadata (
+                client_id VARCHAR(191) PRIMARY KEY,
+                assigned_staff_id VARCHAR(191) NULL,
+                status VARCHAR(24) NOT NULL DEFAULT 'active',
+                is_archived TINYINT(1) NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL,
+                updated_at VARCHAR(40) NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS site_content_imports (
+                source_key VARCHAR(255) PRIMARY KEY,
+                record_type VARCHAR(32) NOT NULL,
+                record_id VARCHAR(191) NOT NULL,
+                imported_at VARCHAR(40) NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS client_chat_imports (
+                source_key VARCHAR(255) PRIMARY KEY,
+                client_id VARCHAR(191) NOT NULL,
+                message_id VARCHAR(191) NOT NULL,
+                imported_at VARCHAR(40) NOT NULL
+            );
+        ");
+    }
+    ensureDatabaseColumn($pdo, 'staff_notes', 'created_by_name', 'VARCHAR(191) NULL');
+
+    $defaultBlogCategories = [
+        ['engineering', 'Engineering'],
+        ['design-systems', 'Design Systems'],
+        ['performance', 'Performance'],
+        ['architecture', 'Architecture'],
+        ['case-study', 'Case Study'],
+        ['strategy', 'Strategy'],
+        ['product-updates', 'Product Updates'],
+    ];
+    $categoryExists = $pdo->prepare('SELECT id FROM blog_categories WHERE id = ?');
+    $categoryInsert = $pdo->prepare('INSERT INTO blog_categories (id, name, slug, parent, is_default, created_at, updated_at) VALUES (?, ?, ?, NULL, 1, ?, ?)');
+    $categoryNow = date('c');
+    foreach ($defaultBlogCategories as [$categoryId, $categoryName]) {
+        $categoryExists->execute([$categoryId]);
+        if (!$categoryExists->fetchColumn()) {
+            $categoryInsert->execute([$categoryId, $categoryName, $categoryId, $categoryNow, $categoryNow]);
+        }
+    }
+}
